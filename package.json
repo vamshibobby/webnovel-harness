@@ -1,0 +1,15 @@
+{
+  "name": "webnovel-harness",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Local, open-source harness for writing web novels chapter-by-chapter with LLMs over OpenRouter.",
+  "scripts": {
+    "setup": "npm --prefix backend install && npm --prefix frontend install",
+    "dev:api": "npm --prefix backend run dev",
+    "dev:ui": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build && npm --prefix backend run build",
+    "start": "cd backend && node dist/index.js",
+    "test": "npm --prefix backend test"
+  }
+}
