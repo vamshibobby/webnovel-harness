@@ -2,6 +2,8 @@
 
 **An open-source, local harness for writing web novels chapter by chapter with LLMs.**
 
+📄 Companion paper: [*Choosing Affordable Language Models for Serial Fiction*](https://zenodo.org/records/22977925) (DOI [10.5281/zenodo.22977925](https://doi.org/10.5281/zenodo.22977925))
+
 This is the same generation backend that runs our hosted web-novel app, extracted so that any
 author can run it on their own machine. You get the same agents, prompts, story-memory tools,
 and cost optimisations. You supply one thing: **an [OpenRouter](https://openrouter.ai) API key**.
@@ -140,7 +142,8 @@ job, under which conditions**:
 > **Choosing Affordable Language Models for Serial Fiction: Instruction Following, Creative
 > Writing, and Story Memory**
 >
-> 📄 *Paper link coming soon.*
+> Sai Vamshi Atukuri, 2026. 📄 **[Read the paper on Zenodo](https://zenodo.org/records/22977925)**,
+> DOI [10.5281/zenodo.22977925](https://doi.org/10.5281/zenodo.22977925)
 
 The study compares six models priced **below $1 per million input and output tokens** across 687
 chapter-generation attempts. It varies instruction detail, output constraints, reasoning settings,
@@ -170,6 +173,19 @@ instruction-design comparison and includes failed calls and tool rounds.*
 
 These are practical starting points from a single-novel study, not a universal literary ranking.
 Paste any of these slugs as a novel's model to try them in the harness.
+
+If you use the harness or the findings, please cite:
+
+```bibtex
+@misc{atukuri2026affordable,
+  author    = {Atukuri, Sai Vamshi},
+  title     = {Choosing Affordable Language Models for Serial Fiction: Instruction Following, Creative Writing, and Story Memory},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.22977925},
+  url       = {https://zenodo.org/records/22977925}
+}
+```
 
 ---
 

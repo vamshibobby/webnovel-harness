@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software or its findings, please cite the companion paper."
+title: "webnovel-harness"
+authors:
+  - family-names: Atukuri
+    given-names: Sai Vamshi
+repository-code: "https://github.com/vamshibobby/webnovel-harness"
+license: MIT
+preferred-citation:
+  type: report
+  title: "Choosing Affordable Language Models for Serial Fiction: Instruction Following, Creative Writing, and Story Memory"
+  authors:
+    - family-names: Atukuri
+      given-names: Sai Vamshi
+  year: 2026
+  publisher:
+    name: Zenodo
+  doi: "10.5281/zenodo.22977925"
+  url: "https://zenodo.org/records/22977925"
