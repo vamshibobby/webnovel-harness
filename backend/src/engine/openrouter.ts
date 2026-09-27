@@ -1,3 +1,4 @@
+import { assertRoleBudget, rolePolicy, recordModelRun, promptHash, type ModelRole } from '../lib/modelPolicy.js';
 /**
  * Minimal OpenRouter chat-completions client with streaming, tool-call, and
  * prompt-caching support. The user's API key is passed per-request (BYOK) and
@@ -51,6 +52,7 @@ export interface Usage {
   /** Prompt tokens written into the cache (1.25x, or 2x for a 1h TTL). */
   cacheWriteTokens: number;
   cost: number;
+  costKnown?: boolean;
 }
 
 export interface StreamResult {
@@ -79,6 +81,7 @@ export class OpenRouterError extends Error {
 }
 
 interface StreamOptions {
+  role?: ModelRole;
   apiKey: string;
   model: string;
   messages: ChatMessage[];
@@ -149,6 +152,7 @@ function parseUsage(raw: RawUsage | undefined): Usage | null {
     cachedTokens: raw.prompt_tokens_details?.cached_tokens ?? 0,
     cacheWriteTokens: raw.prompt_tokens_details?.cache_write_tokens ?? 0,
     cost: raw.cost ?? 0,
+    ...(raw.cost === undefined ? { costKnown: false } : {}),
   };
 }
 
@@ -209,6 +213,34 @@ export function appAttribution(): Record<string, string> {
 }
 
 export async function streamChat(opts: StreamOptions): Promise<StreamResult> {
+  const role = opts.role ?? 'writer';
+  const policy = rolePolicy(role);
+  assertRoleBudget(role);
+  const primary = role === 'writer' ? opts.model : policy.model || opts.model;
+  const models = [...new Set([primary, ...(policy.fallbackModels ?? [])])];
+  let emitted = false;
+  for (let i = 0; i < models.length; i++) {
+    opts.signal?.throwIfAborted();
+    const started = Date.now();
+    const record = { role, model: models[i], provider: null as string | null, promptHash: promptHash(opts.messages), promptVersion: 'harness-2026-09', cost: null as number | null, promptTokens: 0, completionTokens: 0, durationMs: 0 };
+    try {
+      const result = await streamChatOnce({
+        ...opts, model: models[i],
+        maxTokens: policy.maxOutputTokens === undefined ? opts.maxTokens : Math.min(opts.maxTokens ?? policy.maxOutputTokens, policy.maxOutputTokens),
+        onToken: token => { emitted = true; opts.onToken?.(token); },
+        onReasoning: token => { emitted = true; opts.onReasoning?.(token); },
+      });
+      recordModelRun({ ...record, model: result.model || models[i], provider: result.provider, cost: result.usage?.costKnown === false ? null : result.usage?.cost ?? null, promptTokens: result.usage?.promptTokens ?? 0, completionTokens: result.usage?.completionTokens ?? 0, durationMs: Date.now() - started, outcome: 'completed' });
+      return result;
+    } catch (err) {
+      recordModelRun({ ...record, durationMs: Date.now() - started, outcome: 'failed' });
+      if (opts.signal?.aborted || emitted || i === models.length - 1 || !(err instanceof OpenRouterError) || [401, 402, 403].includes(err.status)) throw err;
+    }
+  }
+  throw new Error('No model available');
+}
+
+async function streamChatOnce(opts: StreamOptions): Promise<StreamResult> {
   const model = opts.model;
 
   // Pin to a preferred upstream when one serves this model, so repeat requests

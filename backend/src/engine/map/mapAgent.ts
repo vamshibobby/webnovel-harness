@@ -254,6 +254,7 @@ async function runLoop(args: {
   for (let round = 0; round <= MAX_ROUNDS; round++) {
     const forceStop = round === MAX_ROUNDS;
     const result = await streamChat({
+      role: 'map',
       apiKey: args.apiKey,
       model: args.model,
       messages,

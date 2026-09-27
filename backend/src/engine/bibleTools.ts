@@ -80,6 +80,15 @@ export const upsertBibleToolDefinition: ToolDefinition = {
           type: 'string',
           description: 'Exact id of an existing entry to update. Omit when creating.',
         },
+        evidence: { type: 'string', description: 'An exact passage supporting this update, copied from the supplied chapter.' },
+        newKnowledge: {
+          type: 'array', items: { type: 'object', properties: {
+            fact: { type: 'string' }, kind: { type: 'string', enum: ['knows', 'believes', 'unaware', 'secret'] },
+            via: { type: 'string', description: 'How this character learned or came to believe this.' },
+            evidence: { type: 'string', description: 'Exact chapter passage.' },
+            supersedes: { type: 'string', description: 'Previous knowledge record id, if corrected.' },
+          }, required: ['fact', 'kind', 'via', 'evidence'] },
+        },
         type: {
           type: 'string',
           enum: [
@@ -131,6 +140,7 @@ export const upsertBibleToolDefinition: ToolDefinition = {
                 type: 'string',
                 description: 'One atomic, concrete claim. Use names, not pronouns.',
               },
+              evidence: { type: 'string', description: 'Exact supporting passage.' },
               supersedes: {
                 type: 'string',
                 description:
@@ -202,6 +212,11 @@ export function formatBibleEntry(e: BibleEntry): string {
     for (const f of e.facts) {
       lines.push(`  - [ch ${f.chapter}] ${f.text}${f.supersedes ? ` (supersedes: "${f.supersedes}")` : ''}`);
     }
+  }
+  if (e.canon?.needsReview) lines.push('STATE NEEDS REVIEW: legacy state was invalidated by an edit/deletion. Do not guess missing facts.');
+  if (e.knowledge?.length) {
+    lines.push('CHARACTER KNOWLEDGE (not world truth; private secrets are not reader reveals):');
+    for (const k of e.knowledge) lines.push(`  - ${k.id} [ch ${k.learnedChapter}] ${k.kind}: ${k.fact}; learned via ${k.via}; evidence: ${k.evidence}`);
   }
   return lines.join('\n');
 }

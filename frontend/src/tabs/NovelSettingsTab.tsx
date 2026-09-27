@@ -1,3 +1,4 @@
+import { HarnessSettings } from '../components/HarnessSettings';
 import { useState, type ChangeEvent } from 'react';
 import { del, downloadJson, get, post, settings } from '../lib/api';
 import { go } from '../lib/router';
@@ -6,6 +7,8 @@ import type { TabProps } from '../components/Workspace';
 import { ErrorLine, Field, useAction } from '../components/common';
 
 export function NovelSettingsTab({ novel, base, updateNovel, onNovelsChanged, reloadNovel }: TabProps) {
+  const [modelRoles, setModelRoles] = useState(novel.modelRoles ?? {});
+  const [proseProfile, setProseProfile] = useState(novel.proseProfile ?? {});
   const [form, setForm] = useState({
     title: novel.title,
     premise: novel.premise,
@@ -19,6 +22,7 @@ export function NovelSettingsTab({ novel, base, updateNovel, onNovelsChanged, re
   const save = () =>
     action.run(async () => {
       await updateNovel({
+        modelRoles, proseProfile,
         title: form.title,
         premise: form.premise,
         styleNotes: form.styleNotes,
@@ -35,6 +39,7 @@ export function NovelSettingsTab({ novel, base, updateNovel, onNovelsChanged, re
     <div className="stack narrow-col">
       <div className="card">
         <h3>The novel</h3>
+        <HarnessSettings roles={modelRoles} onRoles={setModelRoles} prose={proseProfile} onProse={setProseProfile} />
         <Field label="Title">
           <input value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
         </Field>

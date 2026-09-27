@@ -184,6 +184,7 @@ export async function runDesignAssist(args: {
   for (let round = 0; round <= MAX_ROUNDS; round++) {
     const forceStop = round === MAX_ROUNDS;
     const result = await streamChat({
+      role: 'characters',
       apiKey: args.apiKey,
       model: DESIGN_MODEL,
       messages,
@@ -501,6 +502,7 @@ export async function runDesignDrift(args: {
 
   for (let round = 0; round <= MAX_ROUNDS; round++) {
     const result = await streamChat({
+      role: 'checker',
       apiKey: args.apiKey,
       model: DESIGN_MODEL,
       messages,

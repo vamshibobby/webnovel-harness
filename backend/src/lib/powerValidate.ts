@@ -671,6 +671,7 @@ export function applyPowerSystemPatch(
     name: patch.name ?? base.name,
     summary: keep(base.summary, patch.summary),
     // 'mixed' is sticky: once both hands have touched it, it stays touched.
+    ...(source === 'author' ? { canonNeedsReview: false } : {}),
     source: existing && existing.source !== source ? 'mixed' : base.source,
     energyName: keep(base.energyName, patch.energyName),
     costsAndLimits: keep(base.costsAndLimits, patch.costsAndLimits),

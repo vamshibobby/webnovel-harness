@@ -1,0 +1,9 @@
+export const ROLE_LABELS = { writer: 'Writer', planner: 'Planner', bible: 'Canon extraction', summarizer: 'Summaries', editor: 'Editor', characters: 'Character design', checker: 'Consistency checks', map: 'Map extraction', suggestions: 'Next-chapter ideas', naming: 'Naming', power: 'Power systems' } as const;
+export type RoleName = keyof typeof ROLE_LABELS;
+export interface RoleModel { model?: string; fallbackModels?: string[]; maxOutputTokens?: number; budgetUsd?: number }
+export type ModelRoles = Partial<Record<RoleName, RoleModel>>;
+export interface ProseProfile { genre?: string; voiceSample?: string; protectedFacts?: string; disabledMetrics?: string[] }
+export interface Knowledge { id: string; fact: string; kind: 'knows' | 'believes' | 'unaware' | 'secret'; learnedChapter: number; via: string; evidence: string; supersedes?: string }
+export interface CanonProposal { id: string; revision: string; state: 'pending' | 'applied' | 'rejected' | 'stale'; changes: Array<{ entryId: string; name: string; conflicts: string[]; patch: { evidence?: string; status?: string; summary?: string; attributes?: Record<string,string>; newFacts?: Array<{text:string; evidence?:string}>; newKnowledge?: Knowledge[]; aliases?: string[]; removeFacts?: string[]; relationships?: Array<{targetId:string; nature:string}> } }>; powerChanges?: Array<{ id: string; name: string; next: Record<string, unknown> }> }
+export interface ModelRun { role: string; model: string; provider: string | null; promptHash: string; promptVersion: string; cost: number | null; promptTokens: number; completionTokens: number; durationMs: number; outcome: 'completed' | 'failed' }
+export interface NovelJob { id: string; chapter: number; mode: 'generate' | 'revise' | 'upkeep'; status: 'running' | 'paused' | 'cancelled' | 'failed' | 'done'; text: string; input: { prompt?: string; notes?: string; model: string }; error?: string; modelRuns: ModelRun[]; stages?: Record<string, string> }

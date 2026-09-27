@@ -505,6 +505,7 @@ export async function runBlueprints(args: BlueprintRunArgs): Promise<BlueprintRu
   args.emit?.({ type: 'trace', data: `Planning chapters ${args.from}–${args.from + args.count - 1}…` });
 
   const result = await streamChat({
+      role: 'planner',
     apiKey: args.apiKey,
     model: PLAN_MODEL,
     messages: buildMessages(args),
@@ -862,6 +863,7 @@ export async function runArcRefine(args: RefineArgs): Promise<RefineResult> {
 
   for (let round = 0; round < REFINE_ROUNDS; round++) {
     const result = await streamChat({
+      role: 'planner',
       apiKey: args.apiKey,
       model: ARC_MODEL,
       messages,
@@ -1099,6 +1101,7 @@ export async function runArcEdit(args: EditArgs): Promise<EditResult> {
     : `THE ARC DESCRIPTION YOU ARE EDITING:\n${args.arc.premise}\n\nReturn it in the "text" field.`;
 
   const result = await streamChat({
+      role: 'planner',
     apiKey: args.apiKey,
     model: ARC_MODEL,
     messages: [

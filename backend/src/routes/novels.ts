@@ -1,3 +1,6 @@
+import { validateProseProfile } from '../lib/proseProfile.js';
+import type { Novel } from '../lib/types.js';
+import { validateModelRoles } from '../lib/modelPolicy.js';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { generateImage } from '../engine/imageGen.js';
@@ -28,6 +31,8 @@ import {
 export const novelRoutes = new Hono<AuthEnv>();
 
 interface NovelBody {
+  modelRoles?: unknown;
+  proseProfile?: unknown;
   title?: unknown;
   premise?: unknown;
   styleNotes?: unknown;
@@ -100,7 +105,7 @@ novelRoutes.get('/:novelId', async (c) => {
 novelRoutes.get('/:novelId/export', async (c) => {
   const novel = await loadAccessibleNovel(c);
   if (!novel) return c.json({ error: 'Novel not found' }, 404);
-  const [chapters, bible, designs, arcs, map, charterDoc, power] = await Promise.all([
+  const [chapters, bible, designs, arcs, map, charterDoc, power, jobs] = await Promise.all([
     store.getAllChapters(novel.id),
     store.listBibleEntries(novel.id),
     store.listDesigns(novel.id),
@@ -108,13 +113,14 @@ novelRoutes.get('/:novelId/export', async (c) => {
     store.getMap(novel.id),
     store.getCharterDoc(novel.id),
     store.listPowerSystems(novel.id),
+    store.listJobs(novel.id),
   ]);
   // The charter is authored material like the bible: a world's naming rules are
   // something the author built, so an export that omitted them would be
   // incomplete in exactly the way the promise above rules out. Null when the
   // author never wrote one — the default is derived, not owned.
   const naming = charterDoc ? normalizeCharter(charterDoc, novel) : null;
-  return c.json({ novel, chapters, bible, designs, arcs, map, naming, power });
+  return c.json({ novel, chapters, bible, designs, arcs, map, naming, power, jobs });
 });
 
 novelRoutes.patch('/:novelId', async (c) => {
@@ -137,7 +143,9 @@ novelRoutes.patch('/:novelId', async (c) => {
       );
     }
 
-    const patch: Record<string, string | number | boolean> = {};
+    const patch: Partial<Novel> = {};
+    if (body.proseProfile !== undefined) patch.proseProfile = validateProseProfile(body.proseProfile);
+    if (body.modelRoles !== undefined) patch.modelRoles = validateModelRoles(body.modelRoles);
 
     // Hiding needs the vault open just as much as unhiding does: a novel put
     // behind a PIN its owner has forgotten would be unreachable, and the unlock

@@ -1,3 +1,4 @@
+import { KnowledgePanel } from '../components/KnowledgePanel';
 import { useState } from 'react';
 import { del, get, patch, post } from '../lib/api';
 import { BIBLE_TYPES, type BibleEntry } from '../lib/types';
@@ -137,6 +138,7 @@ function EntryView({ base, entry, onChanged, onDeleted }: { base: string; entry:
         </button>
       </div>
       <p>{entry.summary}</p>
+      {entry.type === 'character' && <KnowledgePanel records={entry.knowledge} needsReview={entry.canon?.needsReview} onAdd={async record => { await patch(path, { newKnowledge: [record] }); onChanged(); }} />}
       <h3>Facts</h3>
       <ul className="facts">
         {entry.facts.map((f, i) => (

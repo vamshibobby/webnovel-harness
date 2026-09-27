@@ -1,3 +1,6 @@
+import { canonAt, revisionOf } from '../lib/canon.js';
+import { modelRuns } from '../lib/modelPolicy.js';
+import { startJob, jobActive, cancelLocalJob, chapterRevision } from '../lib/jobs.js';
 import { Hono, type Context } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { runChapterAgent } from '../engine/agent.js';
@@ -112,6 +115,56 @@ chapterRoutes.get('/', async (c) => {
   return c.json(await store.listChapters(novel.id));
 });
 
+chapterRoutes.get('/jobs', async c => {
+  const novel = await loadAccessibleNovel(c);
+  if (!novel) return c.json({ error: 'Novel not found' }, 404);
+  return c.json((await store.listJobs(novel.id, true)).map(j => j.status === 'running' && !jobActive(j) ? { ...j, status: 'paused' } : j));
+});
+chapterRoutes.post('/jobs/:jobId/cancel', async c => {
+  const novel = await loadAccessibleNovel(c);
+  if (!novel) return c.json({ error: 'Novel not found' }, 404);
+  const id = c.req.param('jobId');
+  if (!/^(draft|upkeep)-[1-9][0-9]*$/.test(id)) return c.json({ error: 'Invalid job' }, 400);
+  try {
+    await store.transactJob(novel.id, id, job => {
+      if (!job) throw new Error('Job not found');
+      return job.status === 'done' ? job : { ...job, status: 'cancelled', leaseUntil: 0, updatedAt: Date.now() };
+    });
+    cancelLocalJob(novel.id, id);
+    return c.json({ ok: true });
+  } catch (err) { return c.json({ error: err instanceof Error ? err.message : 'Could not stop job' }, 404); }
+});
+
+chapterRoutes.post('/:n/canon/preview', async c => {
+  let release = () => {};
+  const novel = await loadAccessibleNovel(c);
+  if (!novel) return c.json({ error: 'Novel not found' }, 404);
+  const apiKey = openRouterKey(c);
+  if (!apiKey) return c.json({ error: NO_KEY_MESSAGE }, 400);
+  try {
+    const n = chapterNumber(c.req.param('n'), LIMITS.chaptersPerNovel);
+    const chapter = await store.getChapter(novel.id, n);
+    if (!chapter) return c.json({ error: 'Chapter not found' }, 404);
+    release = acquireGenerationSlot(c.get('uid'), c.get('email'), c.get('emailVerified'));
+    const result = await runBibleUpdate({ apiKey, novel, chapter, source: 'chapter', preview: true, signal: c.req.raw.signal });
+    return c.json({ ...result, chapter: await store.getChapter(novel.id, n) });
+  } catch (err) { return c.json({ error: err instanceof Error ? err.message : 'Extraction failed' }, 409); } finally { release(); }
+});
+chapterRoutes.post('/:n/canon/review', async c => {
+  const novel = await loadAccessibleNovel(c);
+  if (!novel) return c.json({ error: 'Novel not found' }, 404);
+  try {
+    const n = chapterNumber(c.req.param('n'), LIMITS.chaptersPerNovel);
+    const body = await readJson<{ proposalId?: unknown; revision?: unknown; accept?: unknown }>(c);
+    if (typeof body.proposalId !== 'string' || typeof body.revision !== 'string' || typeof body.accept !== 'boolean') return c.json({ error: 'proposalId, revision and accept are required' }, 400);
+    const chapter = await store.getChapter(novel.id, n);
+    if (chapter?.status !== 'accepted' && body.accept) return c.json({ error: 'Accept the chapter before adding its changes to canon.' }, 409);
+    await store.resolveCanonProposal(novel.id, n, body.revision, body.accept, body.proposalId);
+    if ((novel.bibleChapter ?? 0) === n - 1) await store.updateNovel(novel.id, { bibleChapter: n });
+    return c.json({ chapter: await store.getChapter(novel.id, n) });
+  } catch (err) { return c.json({ error: err instanceof Error ? err.message : 'Review failed' }, 409); }
+});
+
 chapterRoutes.get('/:n', async (c) => {
   const novel = await loadAccessibleNovel(c);
   if (!novel) return c.json({ error: 'Novel not found' }, 404);
@@ -221,173 +274,91 @@ function handleGeneration(mode: 'generate' | 'revise') {
   return async (c: Context<AuthEnv>) => {
     const novel = await loadAccessibleNovel(c);
     if (!novel) return c.json({ error: 'Novel not found' }, 404);
-
-    let n: number;
-    let model: string;
-    let apiKey: string;
+    let releaseSlot = () => {};
+    let task: Awaited<ReturnType<typeof startJob>>;
     let existing: Chapter | null;
-    let userPrompt: string;
-    let currentDraft: string | undefined;
-    let revisionNotes: string | undefined;
-    let releaseSlot: () => void;
-
+    let n: number;
+    let apiKey: string;
     try {
       n = chapterNumber(c.req.param('n'), LIMITS.chaptersPerNovel);
-      // Chapters are appended, never scattered: without this an arbitrary `n`
-      // creates a sparse document far beyond the end of the novel.
       assertChapterAllowed(n, novel.chapterCount, c.get('email'), c.get('emailVerified'));
-
-      apiKey = openRouterKey(c);
+      apiKey = openRouterKey(c) || '';
       if (!apiKey) return c.json({ error: NO_KEY_MESSAGE }, 400);
-
-      const body = await readJson<GenerateBody>(c);
-      model = safeModelId(body.model, { required: false }) || novel.defaultModel;
-      if (!model) return c.json({ error: 'No model selected' }, 400);
-
+      const body = await readJson<GenerateBody & { resume?: boolean }>(c);
       existing = await store.getChapter(novel.id, n);
-      if (existing?.status === 'accepted') {
-        return c.json({ error: 'Chapter is already accepted' }, 409);
-      }
-
-      if (mode === 'generate') {
-        userPrompt = boundedString(body.prompt, 'prompt', { required: true });
-      } else {
-        if (!existing) return c.json({ error: 'No draft to revise' }, 404);
-        revisionNotes = boundedString(body.notes, 'notes', { required: true });
-        userPrompt = existing.userPrompt;
-        currentDraft = existing.content;
-      }
-
+      if (existing?.status === 'accepted') return c.json({ error: 'Chapter is already accepted' }, 409);
+      if (mode === 'revise' && !existing) return c.json({ error: 'No draft to revise' }, 404);
+      const model = (safeModelId(body.model, { required: false }) || novel.modelRoles?.writer?.model || novel.defaultModel);
+      if (!model) return c.json({ error: 'No model selected' }, 400);
+      const prompt = mode === 'generate' ? boundedString(body.prompt, 'prompt', { required: !body.resume }) : existing!.userPrompt;
+      const notes = mode === 'revise' ? boundedString(body.notes, 'notes', { required: !body.resume }) : '';
       releaseSlot = acquireGenerationSlot(c.get('uid'), c.get('email'), c.get('emailVerified'));
+      task = await startJob(novel.id, n, mode, existing, { prompt, notes, model }, body.resume === true);
     } catch (err) {
-      return apiError(c, err);
+      releaseSlot();
+      return c.json({ error: err instanceof Error ? err.message : 'Could not start this job' }, 409);
     }
-
-    const previous = await store.getAcceptedChapters(novel.id, n);
-    // The bible grounds generation whenever it exists — even in batch mode,
-    // whatever has been captured so far is better than nothing. 'off' skips
-    // the read so the index tokens are not paid for a feature the user closed.
-    const bibleEntries =
-      (novel.bibleMode ?? 'accept') === 'off' ? [] : await store.listBibleEntries(novel.id);
-
-    // Only ACTIVE designs reach generation: drafts are the author's workspace
-    // and retired ones are history. Off means no read at all, so a novel that
-    // never opted in pays nothing for the feature.
-    const designs =
-      (novel.designMode ?? 'off') === 'off'
-        ? []
-        : (await store.listDesigns(novel.id)).filter((d) => d.state === 'active');
-
-    // Power systems have no mode flag: a novel without any pays one cheap
-    // count-free query and an empty list means no block and no tool — the
-    // designs contract, minus the flag, because a system only exists when the
-    // author deliberately built one.
-    const powerSystems = await store.listPowerSystems(novel.id);
-
-    // The arc owning this chapter, and only when steering is on for it. Off
-    // means no read at all, so a novel without arc planning pays nothing.
-    const arc = (novel.arcMode ?? 'off') === 'off' ? null : await arcForChapter(novel.id, n);
-
-    // The naming charter, on the same terms: off means no read. When it is on
-    // and the author has never written one, loadCharter derives a default in
-    // memory and persists nothing, so the feature works from the first chapter
-    // without a model call, a key or a write.
-    const charter = namingOn(novel) ? await loadCharter(novel) : null;
-    // Names coin_name must avoid. The bible is the primary source; when it is
-    // off or still empty, fall back to scanning the prose we already hold in
-    // memory rather than reading the novel a second time.
-    let taken: string[] = [];
-    if (charter) {
-      const map = (novel.mapMode ?? 'off') === 'off' ? null : await store.getMap(novel.id);
-      taken = takenNames({ bible: bibleEntries, designs, map, novel });
-      if (bibleEntries.length === 0) taken = [...new Set([...taken, ...namesInProse(previous)])];
-    }
-
-    // Defeat proxy buffering (Firebase Hosting / GFE sit in front of Cloud Run)
-    // so tokens reach the browser as they are produced rather than in one blob.
     c.header('X-Accel-Buffering', 'no');
     c.header('Cache-Control', 'no-cache, no-transform');
-
-    return streamSSE(c, async (stream) => {
+    return streamSSE(c, async stream => {
+      stream.onAbort(task.pause);
       try {
-        const { content: raw, usage, truncated } = await runChapterAgent({
-          apiKey,
-          model,
-          novel,
-          chapterNumber: n,
-          previous,
-          userPrompt,
-          currentDraft,
-          revisionNotes,
-          bibleEntries,
-          designs,
-          powerSystems,
-          arc,
-          charter,
-          takenNames: taken,
-          emit: (event) => {
-            // Fire-and-forget: SSE writes are queued in order.
+        await stream.writeSSE({ event: 'job', data: JSON.stringify({ id: task.job.id, runId: task.job.runId }) });
+        const [previous, allEntries, allDesigns, powerSystems, arc, charter] = await Promise.all([
+          store.getAcceptedChapters(novel.id, n),
+          (novel.bibleMode ?? 'accept') === 'off' ? [] : store.listBibleEntries(novel.id),
+          (novel.designMode ?? 'off') === 'off' ? [] : store.listDesigns(novel.id),
+          store.listPowerSystems(novel.id),
+          (novel.arcMode ?? 'off') === 'off' ? null : arcForChapter(novel.id, n),
+          namingOn(novel) ? loadCharter(novel) : null,
+        ]);
+        task.signal.throwIfAborted();
+        const bibleEntries = allEntries.filter(e => e.firstChapter <= n).map(e => canonAt(e, n));
+        const designs = allDesigns.filter(d => d.state === 'active');
+        const map = charter && (novel.mapMode ?? 'off') !== 'off' ? await store.getMap(novel.id) : null;
+        let taken = charter ? takenNames({ bible: bibleEntries, designs, map, novel }) : [];
+        if (charter && !bibleEntries.length) taken = [...new Set([...taken, ...namesInProse(previous)])];
+        const partial = task.job.text;
+        task.restart();
+        const currentDraft = partial || (mode === 'revise' ? existing!.content : undefined);
+        const revisionNotes = partial
+          ? `Recover this interrupted draft. Preserve its completed scenes and finish the chapter according to the original direction. Return the COMPLETE chapter. ${task.job.input.notes ?? ''}`
+          : task.job.input.notes;
+        const result = await runChapterAgent({
+          apiKey, model: task.job.input.model, novel, chapterNumber: n, previous,
+          userPrompt: task.job.input.prompt || '', currentDraft, revisionNotes,
+          bibleEntries, designs, powerSystems: powerSystems.filter(s => !s.canonNeedsReview), arc, charter, takenNames: taken, signal: task.signal,
+          emit: event => {
+            if (event.type === 'token') task.token(event.data);
+            if (event.type === 'restart') task.restart();
+            if (event.type === 'trace' || event.type === 'tool') task.trace(event.data);
             void stream.writeSSE({ event: event.type, data: JSON.stringify(event.data) });
           },
-
         });
-
-        const { title, content } = extractTitle(raw, n);
+        task.signal.throwIfAborted();
+        const parsed = extractTitle(result.content, n);
         const now = Date.now();
         const chapter: Chapter = {
-          number: n,
-          title,
-          content,
-          status: 'draft',
-          summary: existing?.summary ?? '',
-          userPrompt,
-          revisionNotes: revisionNotes
-            ? [...(existing?.revisionNotes ?? []), revisionNotes]
-            : (existing?.revisionNotes ?? []),
-          // The draft this replaces. saveChapter sets the whole document, so
-          // the history has to be carried across explicitly or it is deleted
-          // by omission — the same way nextSuggestions is cleared here.
-          versions: pushVersion(existing, mode === 'revise' ? 'revise' : 'generate', revisionNotes),
-          model,
-          createdAt: existing?.createdAt ?? now,
-          updatedAt: now,
+          number: n, ...parsed, status: 'draft', summary: '', userPrompt: task.job.input.prompt || '',
+          revisionNotes: task.job.input.notes ? [...(existing?.revisionNotes ?? []), task.job.input.notes] : existing?.revisionNotes ?? [],
+          versions: pushVersion(existing, mode, task.job.input.notes), model: task.job.input.model,
+          modelRuns: modelRuns(), createdAt: existing?.createdAt ?? now, updatedAt: now,
         };
-        await store.saveChapter(novel.id, chapter);
-        // Word count moves by the difference against whatever this write
-        // replaced — a regenerated draft must not double-count itself.
-        const wordDelta =
-          store.countWords(content) - store.countWords(existing?.content ?? '');
-        await store.updateNovel(novel.id, {
-          wordCount: Math.max(0, novel.wordCount + wordDelta),
-          ...(n > novel.chapterCount ? { chapterCount: n } : {}),
-        });
-        await stream.writeSSE({ event: 'usage', data: JSON.stringify(usage) });
-        // A chapter that stopped at the model's output limit is saved — it is
-        // still the author's draft — but silently saving it is what made this a
-        // bug report: it reads as a model that trails off, not one that ran out
-        // of room. Sent before `done` so the client has it when the draft lands.
-        if (truncated) {
-          await stream.writeSSE({
-            event: 'warning',
-            data: JSON.stringify(
-              'The model reached its output limit, so this chapter stops mid-scene. Revise with ' +
-                '"continue from where it stops", shorten the target chapter length in Novel ' +
-                'settings, or pick a model with more room.'
-            ),
-          });
-        }
+        task.job.text = result.content;
+        task.job.modelRuns = chapter.modelRuns!;
+        await task.checkpoint(true);
+        task.signal.throwIfAborted();
+        await store.saveGeneratedChapter(novel.id, chapter, task.job);
+        await task.finish('done');
+        await stream.writeSSE({ event: 'usage', data: JSON.stringify(result.usage) });
+        if (result.truncated) await stream.writeSSE({ event: 'warning', data: JSON.stringify('The output limit was reached. The incomplete draft is saved; revise to continue the scene.') });
         await stream.writeSSE({ event: 'done', data: JSON.stringify(chapter) });
       } catch (err) {
-        const message =
-          err instanceof OpenRouterError
-            ? err.message
-            : 'Generation failed unexpectedly. Please try again.';
-        console.error(`[${mode}] novel=${novel.id} ch=${n}:`, err);
-        await stream.writeSSE({ event: 'error', data: JSON.stringify(message) });
-      } finally {
-        // Must run on every path, or an aborted stream leaks the slot forever.
-        releaseSlot();
-      }
+        task.job.modelRuns = modelRuns();
+        const message = err instanceof Error ? err.message : 'Generation failed';
+        await task.finish(task.signal.aborted ? 'paused' : 'failed', message);
+        if (!task.signal.aborted) await stream.writeSSE({ event: 'error', data: JSON.stringify(message) });
+      } finally { releaseSlot(); }
     });
   };
 }
@@ -442,12 +413,16 @@ chapterRoutes.post('/:n/humanize', async (c) => {
   c.header('Cache-Control', 'no-cache, no-transform');
 
   return streamSSE(c, async (stream) => {
+    const controller = new AbortController();
+    stream.onAbort(() => controller.abort());
     try {
       const result = await humanizeChapter({
         apiKey,
+        signal: controller.signal,
         model,
         content: existing.content,
         targetWords: novel.chapterLength,
+        disabledMetrics: novel.proseProfile?.disabledMetrics,
         emit: (event) => {
           void stream.writeSSE({ event: event.type, data: JSON.stringify(event.data) });
         },
@@ -474,13 +449,8 @@ chapterRoutes.post('/:n/humanize', async (c) => {
         versions: pushVersion(existing, 'humanize'),
         updatedAt: Date.now(),
       };
-      await store.saveChapter(novel.id, chapter);
-      await store.updateNovel(novel.id, {
-        wordCount: Math.max(
-          0,
-          novel.wordCount + store.countWords(content) - store.countWords(existing.content)
-        ),
-      });
+      controller.signal.throwIfAborted();
+      await store.updateChapterChecked(novel.id, n, chapter, chapterRevision(existing));
 
       await stream.writeSSE({
         event: 'done',
@@ -523,6 +493,7 @@ chapterRoutes.post('/:n/edit', async (c) => {
   let end: number;
   let action: ReturnType<typeof asEditAction>;
   let instruction: string;
+  let protectedFacts: string;
   let releaseSlot: () => void;
 
   try {
@@ -536,9 +507,12 @@ chapterRoutes.post('/:n/edit', async (c) => {
       end?: unknown;
       text?: unknown;
       instruction?: unknown;
+      protectedFacts?: unknown;
       model?: unknown;
     }>(c);
 
+    protectedFacts = boundedString(body.protectedFacts, 'notes');
+    if (protectedFacts.length > 2000) throw new ValidationError('Protected facts must be at most 2000 characters');
     action = asEditAction(body.action);
     instruction = boundedString(body.instruction, 'notes', {
       required: action === 'custom',
@@ -580,10 +554,13 @@ chapterRoutes.post('/:n/edit', async (c) => {
   c.header('Cache-Control', 'no-cache, no-transform');
 
   return streamSSE(c, async (stream) => {
+    const controller = new AbortController();
+    stream.onAbort(() => controller.abort());
     try {
       const charter = namingOn(novel) ? await loadCharter(novel) : null;
       const { replacement, usage, warning } = await runInlineEdit({
         apiKey,
+        signal: controller.signal,
         model,
         novel,
         charter,
@@ -593,7 +570,7 @@ chapterRoutes.post('/:n/edit', async (c) => {
         start,
         end,
         action,
-        instruction,
+        instruction, protectedFacts,
         onToken: (token) => {
           void stream.writeSSE({ event: 'token', data: JSON.stringify(token) });
         },
@@ -618,7 +595,7 @@ chapterRoutes.post('/:n/edit', async (c) => {
 });
 
 /** Above this an inline edit is really a revise, and should be priced like one. */
-const MAX_SELECTION_CHARS = 6_000;
+const MAX_SELECTION_CHARS = 20_000;
 
 function asEditAction(value: unknown) {
   if (!isEditAction(value)) throw new ValidationError('Unknown edit action');
@@ -643,7 +620,7 @@ chapterRoutes.get('/:n/humanize/preview', async (c) => {
     const n = chapterNumber(c.req.param('n'), LIMITS.chaptersPerNovel);
     const chapter = await store.getChapter(novel.id, n);
     if (!chapter) return c.json({ error: 'No draft' }, 404);
-    const d = diagnose(chapter.content, novel.chapterLength);
+    const d = diagnose(chapter.content, novel.chapterLength, novel.proseProfile?.disabledMetrics);
     return c.json({
       defects: d.defects.map((x) => ({ kind: x.kind, observed: x.observed, band: x.band ?? null })),
       words: d.words,
@@ -672,7 +649,7 @@ chapterRoutes.patch('/:n', async (c) => {
     const chapter = await store.getChapter(novel.id, n);
     if (!chapter) return c.json({ error: 'Chapter not found' }, 404);
 
-    const body = await readJson<{ title?: unknown; content?: unknown; origin?: unknown }>(c);
+    const body = await readJson<{ title?: unknown; content?: unknown; origin?: unknown; expectedUpdatedAt?: unknown }>(c);
     const origin: VersionKind =
       body.origin === 'inline' || body.origin === 'restore' ? body.origin : 'edit';
     const patch: Partial<Chapter> = {};
@@ -688,76 +665,21 @@ chapterRoutes.patch('/:n', async (c) => {
       return c.json({ error: 'Nothing to update' }, 400);
     }
 
-    // An accepted chapter's summary is what later chapters remember once the
-    // history is compacted — after an edit it describes text that no longer
-    // exists. Refresh it best-effort; a missing key keeps the old summary
-    // rather than blocking the save.
-    let usage: Usage | null = null;
-    const apiKey = openRouterKey(c);
-    if (contentChanged && chapter.status === 'accepted' && apiKey) {
-      const model = chapter.model || novel.defaultModel;
-      if (model) {
-        try {
-          const result = await streamChat({
-            apiKey,
-            model,
-            messages: buildSummaryMessages(novel, { ...chapter, ...patch }),
-            maxTokens: 500,
-          });
-          patch.summary = result.content.trim();
-          usage = result.usage;
-        } catch (err) {
-          console.error(`[edit] summary refresh failed novel=${novel.id} ch=${n}:`, err);
-        }
-      }
+    if (body.expectedUpdatedAt !== undefined && body.expectedUpdatedAt !== chapter.updatedAt) return c.json({ error: 'This chapter changed in another tab. Reload and compare your saved draft.' }, 409);
+    const usage = null;
+    if (contentChanged) {
+      patch.summary = '';
+      patch.summaryStale = chapter.status === 'accepted';
+      patch.nextSuggestions = [];
+      if (chapter.canonProposal) patch.canonProposal = { ...chapter.canonProposal, state: 'stale' };
     }
 
     // Snapshot before the write, not after — this is the last moment the
     // previous text exists anywhere.
     if (contentChanged) patch.versions = pushVersion(chapter, origin);
 
-    await store.updateChapter(novel.id, n, patch);
-    if (contentChanged) {
-      if (chapter.nextSuggestions?.length) await store.clearNextSuggestions(novel.id, n);
-      const delta = store.countWords(patch.content as string) - store.countWords(chapter.content);
-      await store.updateNovel(novel.id, {
-        wordCount: Math.max(0, novel.wordCount + delta),
-      });
-    }
-    const updated = await store.getChapter(novel.id, n);
-
-    // An edited accepted chapter may have changed canon; re-run the bible on
-    // it, in the same best-effort spirit as the summary refresh above. Only in
-    // 'accept' mode — batch users asked for zero incidental model calls.
-    if (
-      contentChanged &&
-      chapter.status === 'accepted' &&
-      apiKey &&
-      (novel.bibleMode ?? 'accept') === 'accept' &&
-      updated
-    ) {
-      try {
-        const bible = await runBibleUpdate({
-          apiKey,
-          novel,
-          chapter: updated,
-          source: 'chapter',
-        });
-        if (usage && (bible.usage.cost > 0 || bible.usage.promptTokens > 0)) {
-          usage = {
-            promptTokens: usage.promptTokens + bible.usage.promptTokens,
-            completionTokens: usage.completionTokens + bible.usage.completionTokens,
-            cachedTokens: usage.cachedTokens + bible.usage.cachedTokens,
-            cacheWriteTokens: usage.cacheWriteTokens + bible.usage.cacheWriteTokens,
-            cost: usage.cost + bible.usage.cost,
-          };
-        } else if (!usage) {
-          usage = bible.usage;
-        }
-      } catch (err) {
-        console.error(`[bible] edit update failed novel=${novel.id} ch=${n}:`, err);
-      }
-    }
+    const updated = await store.updateChapterChecked(novel.id, n, patch, chapterRevision(chapter));
+    if (contentChanged && chapter.status === 'accepted') await store.invalidateBibleFrom(novel.id, n);
 
     return c.json({ chapter: updated, usage });
   } catch (err) {
@@ -779,6 +701,7 @@ chapterRoutes.delete('/:n', async (c) => {
     const chapter = await store.getChapter(novel.id, n);
     if (!chapter) return c.json({ error: 'Chapter not found' }, 404);
 
+    if ((await store.listJobs(novel.id, true)).some(jobActive)) return c.json({ error: 'Stop the running jobs before deleting a chapter.' }, 409);
     const shifted = await store.deleteChapterAndRenumber(novel.id, n);
     // Facts sourced from the deleted chapter describe canon that no longer
     // exists; provenance above it is off by one. Same contract as the chapter
@@ -787,6 +710,8 @@ chapterRoutes.delete('/:n', async (c) => {
     // established, so there is nothing above the last written chapter to move.
     await store.renumberBibleAfterChapterDelete(novel.id, n);
     await store.renumberMapAfterChapterDelete(novel.id, n);
+    await store.invalidateBibleFrom(novel.id, n);
+    await store.removeJobsFrom(novel.id, n);
     // Arcs are the exception, because a blueprint numbers a chapter that has
     // not been written. Realigning them when nothing actually moved deletes the
     // plan for the draft the author is about to rewrite and slides every later
@@ -794,7 +719,7 @@ chapterRoutes.delete('/:n', async (c) => {
     // Designs need no equivalent — they carry no chapter provenance at all.
     await store.renumberArcsAfterChapterDelete(novel.id, n, shifted > 0);
     if ((novel.bibleChapter ?? 0) >= n) {
-      await store.updateNovel(novel.id, { bibleChapter: (novel.bibleChapter ?? 0) - 1 });
+      await store.updateNovel(novel.id, { bibleChapter: Math.max(0, n - 1), continuityDirtyFrom: n });
     }
     if ((novel.mapChapter ?? 0) >= n) {
       await store.updateNovel(novel.id, { mapChapter: (novel.mapChapter ?? 0) - 1 });
@@ -819,206 +744,115 @@ chapterRoutes.delete('/:n', async (c) => {
  * history is compacted; its cost goes back to the client so the running spend
  * counter stays honest.
  */
-chapterRoutes.post('/:n/accept', async (c) => {
+chapterRoutes.post('/:n/accept', async c => {
   const novel = await loadAccessibleNovel(c);
   if (!novel) return c.json({ error: 'Novel not found' }, 404);
-  let n: number;
-  let model: string;
+  let release = () => {};
   try {
-    n = chapterNumber(c.req.param('n'), LIMITS.chaptersPerNovel);
-    const body = await c.req.json<{ model?: unknown }>().catch(() => ({}) as { model?: unknown });
-    model = safeModelId(body.model, { required: false });
+    const n = chapterNumber(c.req.param('n'), LIMITS.chaptersPerNovel);
+    const body = await readJson<{ model?: unknown; resume?: boolean }>(c);
+    let chapter = await store.getChapter(novel.id, n);
+    if (!chapter) return c.json({ error: 'Chapter not found' }, 404);
+    const apiKey = openRouterKey(c);
+    const model = (safeModelId(body.model, { required: false }) || chapter.model || novel.defaultModel);
+    if (chapter.status !== 'accepted') chapter = await store.updateChapterChecked(novel.id, n, { status: 'accepted', summaryStale: !chapter.summary }, chapterRevision(chapter));
+    const accepted = chapter;
+    let task: Awaited<ReturnType<typeof startJob>> | undefined;
+    if (apiKey && model) {
+      release = acquireGenerationSlot(c.get('uid'), c.get('email'), c.get('emailVerified'));
+      const previous = await store.getJob(novel.id, `upkeep-${n}`);
+      if (previous?.status === 'done' && previous.baseRevision === chapterRevision(accepted) && !accepted.summaryStale) {
+        release(); release = () => {};
+        return streamSSE(c, async stream => { await stream.writeSSE({ event: 'accepted', data: JSON.stringify({ summary: accepted.summary }) }); await stream.writeSSE({ event: 'done', data: JSON.stringify({ ok: true, summary: accepted.summary }) }); });
+      }
+      task = await startJob(novel.id, n, 'upkeep', accepted, { model }, !!previous && previous.status !== 'done' && !accepted.summaryStale && previous.baseRevision === chapterRevision(accepted));
+      if (accepted.summary && !accepted.summaryStale) task.job.stages!.summary = 'done';
+      if (accepted.canonProposal?.revision === revisionOf(accepted.content) && ['applied', 'rejected'].includes(accepted.canonProposal.state)) task.job.stages!.bible = 'done';
+    }
+    c.header('X-Accel-Buffering', 'no');
+    c.header('Cache-Control', 'no-cache, no-transform');
+    return streamSSE(c, async stream => {
+      if (task) stream.onAbort(task.pause);
+      let currentStage: 'summary' | 'suggestions' | 'bible' | 'map' = 'summary';
+      let summary = accepted.summary;
+      const usage = async (value: Usage | null) => { if (value) await stream.writeSSE({ event: 'usage', data: JSON.stringify(value) }); };
+      const trace = (message: string) => { task?.trace(message); void stream.writeSSE({ event: 'trace', data: JSON.stringify(message) }); };
+      try {
+        await stream.writeSSE({ event: 'accepted', data: JSON.stringify({ summary }) });
+        if (!task || !apiKey) { await stream.writeSSE({ event: 'done', data: JSON.stringify({ ok: true, summary, maintenancePending: true }) }); return; }
+        await stream.writeSSE({ event: 'job', data: JSON.stringify({ id: task.job.id, runId: task.job.runId }) });
+        const stages = task.job.stages!;
+        if (stages.summary !== 'done') {
+          trace('Refreshing chapter summary…');
+          const result = await streamChat({ role: 'summarizer', apiKey, model, messages: buildSummaryMessages(novel, accepted), maxTokens: 500, signal: task.signal, onToken: token => { void stream.writeSSE({ event: 'token', data: JSON.stringify(token) }); } });
+          summary = result.content.trim();
+          if (!summary) throw new Error('The summary was empty. Retry memory refresh.');
+          await store.updateChapterChecked(novel.id, n, { summary, summaryStale: false }, chapterRevision(accepted));
+          await usage(result.usage); stages.summary = 'done'; await task.checkpoint(true);
+        }
+        currentStage = 'suggestions';
+        if (stages.suggestions !== 'done') {
+          const planned = (novel.arcMode ?? 'off') === 'off' ? null : await blueprintForChapter(novel.id, n + 1);
+          if ((novel.suggestMode ?? 'on') === 'on' && !planned) {
+            trace('Preparing next-chapter directions…');
+            const [previous, bibleEntries, designs] = await Promise.all([store.getAcceptedChapters(novel.id, n), store.listBibleEntries(novel.id), store.listDesigns(novel.id)]);
+            const result = await runSuggestions({ apiKey, novel, chapter: { ...accepted, summary }, previous, bibleEntries, designs: designs.filter(d => d.state === 'active'), signal: task.signal });
+            await store.updateChapterChecked(novel.id, n, { nextSuggestions: result.suggestions }, chapterRevision(accepted));
+            await usage(result.usage);
+            await stream.writeSSE({ event: 'suggestions', data: JSON.stringify({ forChapter: n + 1, suggestions: result.suggestions }) });
+          }
+          stages.suggestions = 'done'; await task.checkpoint(true);
+        }
+        currentStage = 'bible';
+        if (stages.bible !== 'done') {
+          if ((novel.bibleMode ?? 'accept') === 'accept') {
+            const current = await store.getChapter(novel.id, n);
+            if (current?.canonProposal?.state === 'pending' && current.canonProposal.revision === revisionOf(accepted.content)) {
+              stages.bible = 'review';
+            } else {
+              trace('Updating story bible…');
+              const result = await runBibleUpdate({ apiKey, novel, chapter: { ...accepted, summary }, source: 'chapter', signal: task.signal, emit: e => { if (e.type === 'trace') trace(e.data); } });
+              await usage(result.usage);
+              stages.bible = result.pendingReview ? 'review' : 'done';
+              await stream.writeSSE({ event: 'bible', data: JSON.stringify(result) });
+              if (!result.pendingReview && (novel.bibleChapter ?? 0) === n - 1) await store.updateNovel(novel.id, { bibleChapter: n });
+            }
+          } else stages.bible = 'done';
+          await task.checkpoint(true);
+          if (stages.bible === 'review') {
+            trace('Review this chapter’s canon changes before continuing memory upkeep.');
+            task.job.modelRuns = modelRuns();
+            await task.finish('paused');
+            await stream.writeSSE({ event: 'done', data: JSON.stringify({ ok: true, summary, pendingReview: true }) });
+            return;
+          }
+        }
+        currentStage = 'map';
+        if (stages.map !== 'done') {
+          if ((novel.mapMode ?? 'off') === 'accept') {
+            trace('Updating the map…');
+            const result = await runMapUpdate({ apiKey, novel, chapter: accepted, signal: task.signal, emit: e => { if (e.type === 'trace') trace(e.data); } });
+            await usage(result.usage);
+            await stream.writeSSE({ event: 'map', data: JSON.stringify(result) });
+            if ((novel.mapChapter ?? 0) === n - 1) await store.updateNovel(novel.id, { mapChapter: n });
+          }
+          stages.map = 'done';
+        }
+        task.job.modelRuns = modelRuns();
+        await task.finish('done');
+        await stream.writeSSE({ event: 'done', data: JSON.stringify({ ok: true, summary }) });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Memory upkeep failed';
+        if (task) {
+          task.job.stages![currentStage] = 'failed';
+          task.job.modelRuns = modelRuns();
+          await task.finish(task.signal.aborted ? 'paused' : 'failed', message);
+        }
+        await stream.writeSSE({ event: 'error', data: JSON.stringify(message) });
+      } finally { release(); }
+    });
   } catch (err) {
-    return apiError(c, err);
+    release();
+    return c.json({ error: err instanceof Error ? err.message : 'Could not accept chapter' }, 409);
   }
-  const chapter = await store.getChapter(novel.id, n);
-  if (!chapter) return c.json({ error: 'Chapter not found' }, 404);
-
-  const apiKey = openRouterKey(c);
-  const summaryModel = model || chapter.model || novel.defaultModel;
-  const alreadyAccepted = chapter.status === 'accepted';
-
-  c.header('X-Accel-Buffering', 'no');
-  c.header('Cache-Control', 'no-cache, no-transform');
-
-  return streamSSE(c, async (stream) => {
-    // Idempotent short-circuit, in the same SSE shape the client expects.
-    if (alreadyAccepted) {
-      await stream.writeSSE({ event: 'accepted', data: JSON.stringify({ summary: chapter.summary }) });
-      await stream.writeSSE({
-        event: 'done',
-        data: JSON.stringify({ ok: true, summary: chapter.summary }),
-      });
-      return;
-    }
-
-    let summary = '';
-    if (apiKey && summaryModel) {
-      try {
-        const result = await streamChat({
-          apiKey,
-          model: summaryModel,
-          messages: buildSummaryMessages(novel, chapter),
-          maxTokens: 500,
-          onToken: (token) => {
-            void stream.writeSSE({ event: 'token', data: JSON.stringify(token) });
-          },
-        });
-        summary = result.content.trim();
-        if (result.usage) {
-          await stream.writeSSE({ event: 'usage', data: JSON.stringify(result.usage) });
-        }
-      } catch (err) {
-        // Best effort: the chapter still gets accepted with no summary rather
-        // than blocking the writer on a summary failure.
-        console.error(`[accept] summary failed novel=${novel.id} ch=${n}:`, err);
-      }
-    }
-
-    await store.updateChapter(novel.id, n, { status: 'accepted', summary });
-
-    // The chapter is now canon, and that is the moment the writer is waiting
-    // for — everything below is upkeep. Saying so as its own event lets the
-    // client move them to the next chapter while the bible catches up behind
-    // them, instead of holding the editor hostage to a second model call.
-    await stream.writeSSE({ event: 'accepted', data: JSON.stringify({ summary }) });
-
-    // Next-chapter directions, first among the upkeep jobs. The writer has just
-    // been moved to an empty chapter N+1 and is looking at the box; the bible
-    // and the map are invisible to them until they open those pages. So this
-    // one goes first even though it is the newest — the ordering follows who is
-    // waiting, not what was built when.
-    /*
-     * A chapter that is already planned needs no directions. The author will
-     * be looking at a blueprint they wrote and accepted, and proposing three
-     * alternatives beside it is both a wasted call and a worse screen — so the
-     * agent is never invoked rather than invoked and hidden. Asking for three
-     * on demand still works, for going off-plan deliberately.
-     */
-    const plannedNext =
-      (novel.arcMode ?? 'off') === 'off' ? null : await blueprintForChapter(novel.id, n + 1);
-
-    if ((novel.suggestMode ?? 'on') === 'on' && apiKey && !plannedNext) {
-      try {
-        const [previous, bibleEntries, designs] = await Promise.all([
-          store.getAcceptedChapters(novel.id, n),
-          (novel.bibleMode ?? 'accept') === 'off'
-            ? Promise.resolve([])
-            : store.listBibleEntries(novel.id),
-          (novel.designMode ?? 'off') === 'off'
-            ? Promise.resolve([])
-            : store.listDesigns(novel.id),
-        ]);
-        const proposal = await runSuggestions({
-          apiKey,
-          novel,
-          chapter: { ...chapter, status: 'accepted', summary },
-          previous,
-          bibleEntries,
-          designs: designs.filter((d) => d.state === 'active'),
-          emit: (event) => {
-            if (event.type === 'trace') {
-              void stream.writeSSE({ event: 'trace', data: JSON.stringify(event.data) });
-            }
-          },
-        });
-        // Stored on the chapter they were read FROM — chapter n+1 has no
-        // document yet, and this way a later renumbering carries them along.
-        await store.updateChapter(novel.id, n, { nextSuggestions: proposal.suggestions });
-        if (proposal.usage.cost > 0 || proposal.usage.promptTokens > 0) {
-          await stream.writeSSE({ event: 'usage', data: JSON.stringify(proposal.usage) });
-        }
-        await stream.writeSSE({
-          event: 'suggestions',
-          data: JSON.stringify({ forChapter: n + 1, suggestions: proposal.suggestions }),
-        });
-      } catch (err) {
-        // Silent by design: an author who never sees the cards does not know
-        // they were promised any, and "we could not think of three ideas" is
-        // not news worth a line in the strip.
-        console.error(`[suggest] accept failed novel=${novel.id} ch=${n}:`, err);
-      }
-    }
-
-    // Story bible upkeep, mode-gated. Best-effort by contract: the chapter is
-    // already accepted above, and a bible failure must never undo or delay
-    // that. Usage is streamed as its own event so the client bills the turn
-    // honestly.
-    if ((novel.bibleMode ?? 'accept') === 'accept' && apiKey) {
-      try {
-        await stream.writeSSE({ event: 'trace', data: JSON.stringify('Updating story bible…') });
-        const bible = await runBibleUpdate({
-          apiKey,
-          novel,
-          chapter: { ...chapter, status: 'accepted', summary },
-          source: 'chapter',
-          emit: (event) => {
-            if (event.type === 'trace') {
-              void stream.writeSSE({ event: 'trace', data: JSON.stringify(event.data) });
-            }
-          },
-        });
-        if (bible.usage.cost > 0 || bible.usage.promptTokens > 0) {
-          await stream.writeSSE({ event: 'usage', data: JSON.stringify(bible.usage) });
-        }
-        await stream.writeSSE({
-          event: 'bible',
-          data: JSON.stringify({ created: bible.created, updated: bible.updated, power: bible.power }),
-        });
-        // Advance the high-water mark only when contiguous. If earlier
-        // chapters are unreflected (a spell in batch/off mode), jumping the
-        // mark to n would skip them forever; leaving it makes the next
-        // catch-up run cover the gap, and redoing this chapter there is safe
-        // (facts dedup by text).
-        if ((novel.bibleChapter ?? 0) === n - 1) {
-          await store.updateNovel(novel.id, { bibleChapter: n });
-        }
-      } catch (err) {
-        console.error(`[bible] accept update failed novel=${novel.id} ch=${n}:`, err);
-        await stream.writeSSE({
-          event: 'trace',
-          data: JSON.stringify('Story bible update failed — it will catch up on the next run.'),
-        });
-      }
-    }
-
-    // Atlas upkeep, its own try/catch after the bible's: a bible failure must
-    // not skip the map, and a map failure must not fail the accept. It runs
-    // second so that a location entry the bible just created is already there
-    // for the map to link to.
-    if ((novel.mapMode ?? 'off') === 'accept' && apiKey) {
-      try {
-        await stream.writeSSE({ event: 'trace', data: JSON.stringify('Updating the map…') });
-        const map = await runMapUpdate({
-          apiKey,
-          novel,
-          chapter,
-          emit: (event) => {
-            if (event.type === 'trace') {
-              void stream.writeSSE({ event: 'trace', data: JSON.stringify(event.data) });
-            }
-          },
-        });
-        if (map.usage.cost > 0 || map.usage.promptTokens > 0) {
-          await stream.writeSSE({ event: 'usage', data: JSON.stringify(map.usage) });
-        }
-        await stream.writeSSE({
-          event: 'map',
-          data: JSON.stringify({ entitiesAdded: map.entitiesAdded, factsAdded: map.factsAdded }),
-        });
-        // Contiguous-advance only, same reasoning as bibleChapter above.
-        if ((novel.mapChapter ?? 0) === n - 1) {
-          await store.updateNovel(novel.id, { mapChapter: n });
-        }
-      } catch (err) {
-        console.error(`[map] accept update failed novel=${novel.id} ch=${n}:`, err);
-        await stream.writeSSE({
-          event: 'trace',
-          data: JSON.stringify('Map update failed — it will catch up on the next run.'),
-        });
-      }
-    }
-
-    await stream.writeSSE({ event: 'done', data: JSON.stringify({ ok: true, summary }) });
-  });
 });

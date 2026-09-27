@@ -427,6 +427,7 @@ async function runProposalLoop<T>(args: {
   async function runRounds(): Promise<{ value: T; usage: Usage }> {
   for (let round = 0; round < MAX_ROUNDS; round++) {
     const result = await streamChat({
+      role: 'power',
       apiKey: args.apiKey,
       model: POWER_MODEL,
       messages,

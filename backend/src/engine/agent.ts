@@ -307,6 +307,7 @@ export async function runChapterAgent(args: {
     };
 
     const result = await streamChat({
+      role: 'writer',
       apiKey: args.apiKey,
       model: args.model,
       sampling: args.sampling,

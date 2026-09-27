@@ -260,7 +260,8 @@ export async function handleUpsertPowerSystem(
   systems: PowerSystem[],
   entries: BibleEntry[],
   source: PowerSource,
-  onWrote?: (system: PowerSystem) => void
+  onWrote?: (system: PowerSystem) => void,
+  stage?: (id: string, merge: (current: PowerSystem | null) => PowerSystem) => Promise<PowerSystem>
 ): Promise<string> {
   try {
     const id = String(raw.id ?? '').trim();
@@ -274,7 +275,7 @@ export async function handleUpsertPowerSystem(
     }
 
     const patch = validatePowerSystemPatch(raw, { entries, existing });
-    const next = await store.transactPowerSystem(novelId, existing.id, (current) =>
+    const next = await (stage ?? ((id, merge) => store.transactPowerSystem(novelId, id, merge)))(existing.id, (current) =>
       applyPowerSystemPatch(current ?? existing, existing.id, patch, source)
     );
     onWrote?.(next);

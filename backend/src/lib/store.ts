@@ -1,3 +1,7 @@
+import type { NovelJob } from './jobs.js';
+import { chapterRevision } from './jobs.js';
+import { deleteCanonChapter, invalidateCanon, revisionOf, entryHash, type CanonProposal } from './canon.js';
+import { applyBiblePatch } from './bibleValidate.js';
 import { deriveShapes } from '../engine/map/regions.js';
 import { solveMap } from '../engine/map/solver.js';
 import { activeFacts, relationEntityIds, type GeoMap } from '../engine/map/types.js';
@@ -13,6 +17,7 @@ import {
   removeDoc,
   removeTree,
   writeDoc,
+  writeDocuments,
 } from './localdb.js';
 import { shiftArcAfterChapterDelete } from './arcValidate.js';
 import { unlinkEntryFromSystem } from './powerValidate.js';
@@ -33,7 +38,7 @@ import type {
  * localdb.ts for the on-disk layout and why every call is synchronous.
  */
 
-type Collection = 'chapters' | 'bible' | 'designs' | 'maps' | 'arcs' | 'naming' | 'power';
+type Collection = 'chapters' | 'bible' | 'designs' | 'maps' | 'arcs' | 'naming' | 'power' | 'jobs';
 
 const novelDir = (novelId: string) => dataPath('novels', novelId);
 const novelFile = (novelId: string) => dataPath('novels', novelId, 'novel.json');
@@ -160,6 +165,9 @@ export async function updateNovel(
       | 'premise'
       | 'styleNotes'
       | 'defaultModel'
+      | 'modelRoles'
+      | 'proseProfile'
+      | 'continuityDirtyFrom'
       | 'chapterLength'
       | 'chapterCount'
       | 'wordCount'
@@ -329,15 +337,49 @@ export async function deleteBibleEntry(novelId: string, id: string): Promise<voi
  * exists (drop them), and provenance above it is off by one (decrement).
  */
 export async function renumberBibleAfterChapterDelete(novelId: string, n: number): Promise<void> {
-  for (const entry of listCollection<BibleEntry>(novelId, 'bible')) {
-    const facts = entry.facts
-      .filter((f) => f.chapter !== n)
-      .map((f) => (f.chapter > n ? { ...f, chapter: f.chapter - 1 } : f));
-    const firstChapter = entry.firstChapter > n ? entry.firstChapter - 1 : entry.firstChapter;
-    if (facts.length !== entry.facts.length || firstChapter !== entry.firstChapter) {
-      setDoc(novelId, 'bible', entry.id, { ...entry, facts, firstChapter, updatedAt: Date.now() });
+  for (const entry of listCollection<BibleEntry>(novelId, 'bible')) setDoc(novelId, 'bible', entry.id, deleteCanonChapter(entry, n));
+}
+
+export async function invalidateBibleFrom(novelId: string, n: number): Promise<void> {
+  const novel = readNovel(novelId)!;
+  const writes: Array<{file: string; data: unknown}> = [];
+  for (const entry of listCollection<BibleEntry>(novelId, 'bible')) writes.push({ file: docFile(novelId, 'bible', entry.id), data: invalidateCanon(entry, n) });
+  for (const ch of listCollection<Chapter>(novelId, 'chapters')) if (ch.number >= n) writes.push({ file: docFile(novelId, 'chapters', chapterId(ch.number)), data: { ...ch, summary: '', summaryStale: ch.status === 'accepted', nextSuggestions: [], ...(ch.canonProposal ? { canonProposal: { ...ch.canonProposal, state: 'stale' } } : {}) } });
+  for (const system of listCollection<PowerSystem>(novelId, 'power')) if ((system.canonChapter ?? 0) >= n) writes.push({ file: docFile(novelId, 'power', system.id), data: { ...system, canonNeedsReview: true } });
+  writes.push({ file: novelFile(novelId), data: { ...novel, bibleChapter: Math.min(novel.bibleChapter ?? 0, Math.max(0, n - 1)), continuityDirtyFrom: Math.min(novel.continuityDirtyFrom ?? n, n) } });
+  writeDocuments(writes);
+}
+
+export async function saveCanonProposal(novelId: string, n: number, proposal: CanonProposal): Promise<void> {
+  transact<Chapter>(novelId, 'chapters', chapterId(n), chapter => {
+    if (!chapter || revisionOf(chapter.content) !== proposal.revision) throw new Error('Chapter changed during extraction. Run the canon update again.');
+    return { ...chapter, canonProposal: proposal };
+  });
+}
+
+export async function resolveCanonProposal(novelId: string, n: number, revision: string, accept: boolean, proposalId: string): Promise<void> {
+  const chapter = getDoc<Chapter>(novelId, 'chapters', chapterId(n));
+  const proposal = chapter?.canonProposal;
+  if (!chapter || !proposal || proposal.id !== proposalId || proposal.revision !== revision || revisionOf(chapter.content) !== revision) throw new Error('Chapter changed. Extract canon again before reviewing it.');
+  if (proposal.state !== 'pending') return;
+  const writes: Array<{ file: string; data: unknown }> = [];
+  if (accept) {
+    const originals = new Map([...new Set(proposal.changes.map(c => c.entryId))].map(id => [id, getDoc<BibleEntry>(novelId, 'bible', id)]));
+    for (const change of proposal.powerChanges ?? []) {
+      if (revisionOf(JSON.stringify(getDoc<PowerSystem>(novelId, 'power', change.id))) !== change.baseHash) throw new Error('Power system changed. Extract canon again.');
     }
+    const next = new Map(originals);
+    for (const c of proposal.changes) {
+      if (entryHash(originals.get(c.entryId) ?? null) !== c.baseHash) throw new Error('Canon changed in another operation. Extract again to compare against the latest entries.');
+      const updated = applyBiblePatch(next.get(c.entryId) ?? null, c.entryId, c.patch, n, { revision, origin: 'chapter' });
+      if (updated.canon) updated.canon.needsReview = false;
+      next.set(c.entryId, updated);
+    }
+    for (const [id, entry] of next) writes.push({ file: docFile(novelId, 'bible', id), data: entry });
+    for (const change of proposal.powerChanges ?? []) writes.push({ file: docFile(novelId, 'power', change.id), data: change.next });
   }
+  writes.push({ file: docFile(novelId, 'chapters', chapterId(n)), data: { ...chapter, canonProposal: { ...proposal, state: accept ? 'applied' : 'rejected' } } });
+  writeDocuments(writes);
 }
 
 // ── Character designs ─────────────────────────────────────────────────────
@@ -630,4 +672,38 @@ export async function unlinkPowerFromBibleEntry(novelId: string, entryId: string
       return unlinkEntryFromSystem(current, entryId) ?? current;
     });
   }
+}
+
+export async function listJobs(novelId: string, unfinishedOnly = false): Promise<NovelJob[]> { return listCollection<NovelJob>(novelId, 'jobs').filter(j => !unfinishedOnly || j.status !== 'done'); }
+export async function getJob(novelId: string, id: string): Promise<NovelJob | null> { return getDoc(novelId, 'jobs', id); }
+export async function transactJob(novelId: string, id: string, merge: (job: NovelJob | null) => NovelJob): Promise<NovelJob> {
+  return transact(novelId, 'jobs', id, current => { const next = merge(current as NovelJob | null); if (!next) throw new Error('Job no longer exists'); return next; });
+}
+export async function saveGeneratedChapter(novelId: string, chapter: Chapter, job: NovelJob): Promise<void> {
+  const previous = getDoc<Chapter>(novelId, 'chapters', chapterId(chapter.number));
+  const currentJob = getDoc<NovelJob>(novelId, 'jobs', job.id);
+  const novel = readNovel(novelId);
+  if (!novel || chapterRevision(previous) !== job.baseRevision || currentJob?.runId !== job.runId || currentJob.status !== 'running') throw new Error('Chapter or job changed. Your generated text is kept in the job for recovery.');
+  writeDocuments([
+    { file: docFile(novelId, 'chapters', chapterId(chapter.number)), data: chapter },
+    { file: novelFile(novelId), data: { ...novel, wordCount: Math.max(0, novel.wordCount + countWords(chapter.content) - countWords(previous?.content ?? '')), chapterCount: Math.max(novel.chapterCount, chapter.number), updatedAt: Date.now() } },
+    { file: docFile(novelId, 'jobs', job.id), data: { ...job, status: 'done', leaseUntil: 0, updatedAt: Date.now() } },
+  ]);
+}
+
+export async function updateChapterChecked(novelId: string, n: number, patch: Partial<Chapter>, expectedRevision: string): Promise<Chapter> {
+  const previous = getDoc<Chapter>(novelId, 'chapters', chapterId(n));
+  if (!previous || chapterRevision(previous) !== expectedRevision) throw new Error('The chapter changed in another tab. Your text is kept locally; reload and compare before saving.');
+  const next = { ...previous, ...patch, updatedAt: Date.now() };
+  const writes: Array<{file: string; data: unknown}> = [{ file: docFile(novelId, 'chapters', chapterId(n)), data: next }];
+  if (patch.content !== undefined) {
+    const novel = readNovel(novelId)!;
+    writes.push({ file: novelFile(novelId), data: { ...novel, wordCount: Math.max(0, novel.wordCount + countWords(next.content) - countWords(previous.content)), updatedAt: Date.now() } });
+  }
+  writeDocuments(writes);
+  return next;
+}
+
+export async function removeJobsFrom(novelId: string, n: number): Promise<void> {
+  for (const job of await listJobs(novelId)) if (job.chapter >= n) removeDoc(docFile(novelId, 'jobs', job.id));
 }

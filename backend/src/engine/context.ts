@@ -244,6 +244,8 @@ export function buildSystemPrompt(novel: Novel, charter?: NamingCharter | null):
   const naming = charter ? buildNamingBlock(novel, charter) : '';
   if (naming) parts.push(naming);
 
+  if (novel.proseProfile?.genre) parts.push(`GENRE AND REGISTER: ${novel.proseProfile.genre}`);
+  if (novel.proseProfile?.voiceSample) parts.push(`AUTHOR'S VOICE SAMPLE (match its register and rhythm, without copying its events):\n${novel.proseProfile.voiceSample}`);
   parts.push(...craftRules());
 
   /*
@@ -272,6 +274,7 @@ export function buildSystemPrompt(novel: Novel, charter?: NamingCharter | null):
     [
       'PEOPLE:',
       '- Characters speak from what they know of each other. Every fact one character shows they know about another has to have reached them on the page.',
+      '- Fetch participating characters with get_story_bible_entries and inspect their knowledge records. World truth is not shared knowledge. Beliefs may be wrong; unaware means the character has not learned the fact; secrets remain private until the scene actually reveals them. Missing records are uncertainty, never proof of knowledge.',
       '- Everyone in a scene wants something of their own. What one person thinks of another shows in how they treat them, not in an assessment delivered aloud.',
     ].join('\n')
   );

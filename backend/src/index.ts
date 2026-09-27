@@ -1,3 +1,4 @@
+import { withModelPolicy } from './lib/modelPolicy.js';
 import { loadDotEnv } from './lib/env.js';
 loadDotEnv();
 
@@ -85,6 +86,7 @@ app.get('/files/covers/:name', (c) => {
 });
 
 const api = new Hono<AuthEnv>();
+api.use('*', (_c, next) => withModelPolicy({}, next));
 api.use('*', localUser);
 // Registered before /novels so these cannot be captured as a novel id.
 api.get('/styles', (c) => c.json(listStyles()));

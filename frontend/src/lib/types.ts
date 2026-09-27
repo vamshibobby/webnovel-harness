@@ -1,6 +1,10 @@
+import type { ModelRoles, ProseProfile, CanonProposal, Knowledge, ModelRun } from './harnessTypes';
 /* The slices of the server's shapes this UI actually reads. Loose on purpose. */
 
 export interface Novel {
+  modelRoles?: ModelRoles;
+  proseProfile?: ProseProfile;
+  continuityDirtyFrom?: number;
   id: string;
   title: string;
   premise: string;
@@ -55,6 +59,9 @@ export interface ChapterVersion {
 }
 
 export interface Chapter {
+  canonProposal?: CanonProposal;
+  summaryStale?: boolean;
+  modelRuns?: ModelRun[];
   number: number;
   title: string;
   content: string;
@@ -78,6 +85,8 @@ export interface Usage {
 }
 
 export interface BibleEntry {
+  knowledge?: Knowledge[];
+  canon?: { needsReview?: boolean };
   id: string;
   type: string;
   name: string;
@@ -178,6 +187,7 @@ export interface CastProposal {
 }
 
 export interface PowerSystem {
+  canonNeedsReview?: boolean;
   id: string;
   name: string;
   summary: string;

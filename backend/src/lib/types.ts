@@ -1,3 +1,6 @@
+import type { ProseProfile } from './proseProfile.js';
+import type { CanonHistory, CanonProposal } from './canon.js';
+import type { ModelRoles, ModelRun } from './modelPolicy.js';
 import type { StyleKey } from '../engine/styles.js';
 
 export interface Novel {
@@ -12,6 +15,9 @@ export interface Novel {
    */
   style: StyleKey;
   defaultModel: string;
+  modelRoles?: ModelRoles;
+  proseProfile?: ProseProfile;
+  continuityDirtyFrom?: number;
   /** Target words per chapter. 0 leaves it to the model. */
   chapterLength: number;
   chapterCount: number;
@@ -163,7 +169,21 @@ export const BIBLE_ENTRY_TYPES: readonly BibleEntryType[] = [
  * One atomic claim about an entity, with chapter provenance so deleting or
  * renumbering chapters can keep the log honest.
  */
+export interface CharacterKnowledge {
+  id: string;
+  fact: string;
+  kind: 'knows' | 'believes' | 'unaware' | 'secret';
+  learnedChapter: number;
+  via: string;
+  evidence: string;
+  sourceRevision?: string;
+  supersedes?: string;
+}
+
 export interface BibleFact {
+  id?: string;
+  revision?: string;
+  evidence?: string;
   text: string;
   chapter: number;
   /** When canon changed, the text of the fact this one replaces. */
@@ -178,6 +198,8 @@ export interface BibleFact {
  * current truth is cheap to read while the history stays intact.
  */
 export interface BibleEntry {
+  canon?: CanonHistory;
+  knowledge?: CharacterKnowledge[];
   /** Slug of the name, e.g. "kael-veyron". Doc id. */
   id: string;
   type: BibleEntryType;
@@ -376,6 +398,9 @@ export interface RegionalPowerLevel {
  * chapters never touches it.
  */
 export interface PowerSystem {
+  canonChapter?: number;
+  canonRevision?: string;
+  canonNeedsReview?: boolean;
   /** Slug of the name. Doc id. */
   id: string;
   name: string;
@@ -747,6 +772,9 @@ export interface ChapterSuggestion {
 }
 
 export interface Chapter {
+  canonProposal?: CanonProposal;
+  summaryStale?: boolean;
+  modelRuns?: ModelRun[];
   number: number;
   title: string;
   content: string;

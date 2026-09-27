@@ -1,3 +1,5 @@
+import { recordCanon, revisionOf } from './canon.js';
+import type { CharacterKnowledge } from './types.js';
 import {
   BIBLE_ENTRY_TYPES,
   type BibleEntry,
@@ -79,6 +81,8 @@ export function validBibleType(value: unknown): BibleEntryType {
  * firstChapter) are added by the store.
  */
 export interface BibleEntryPatch {
+  evidence?: string;
+  newKnowledge?: CharacterKnowledge[];
   type?: BibleEntryType;
   name?: string;
   aliases?: string[];
@@ -99,6 +103,19 @@ export function validateBiblePatch(raw: unknown, chapter: number): BibleEntryPat
   const input = raw as Record<string, unknown>;
   const patch: BibleEntryPatch = {};
 
+  if (input.evidence !== undefined) patch.evidence = str(input.evidence, 'evidence', 800);
+  if (input.newKnowledge !== undefined) {
+    if (!Array.isArray(input.newKnowledge) || input.newKnowledge.length > 20) fail('newKnowledge must contain at most 20 records');
+    patch.newKnowledge = (input.newKnowledge as unknown[]).map((value, i) => {
+      if (!value || typeof value !== 'object') fail(`newKnowledge[${i}] must be an object`);
+      const k = value as Record<string, unknown>;
+      if (!['knows', 'believes', 'unaware', 'secret'].includes(String(k.kind))) fail('Knowledge kind must be knows, believes, unaware or secret');
+      const fact = str(k.fact, 'knowledge.fact', 500, { required: true });
+      const evidence = str(k.evidence, 'knowledge.evidence', 800, { required: true });
+      const supersedes = str(k.supersedes, 'knowledge.supersedes', 64);
+      return { id: revisionOf(JSON.stringify([chapter, fact, k.kind])), fact, kind: k.kind as CharacterKnowledge['kind'], learnedChapter: chapter, via: str(k.via, 'knowledge.via', 300, { required: true }), evidence, ...(supersedes ? { supersedes } : {}) };
+    });
+  }
   if (input.type !== undefined) patch.type = validBibleType(input.type);
   if (input.name !== undefined) {
     patch.name = str(input.name, 'name', BIBLE_LIMITS.name, { required: true });
@@ -150,6 +167,8 @@ export function validateBiblePatch(raw: unknown, chapter: number): BibleEntryPat
           text: str(obj.text, `newFacts[${i}].text`, BIBLE_LIMITS.fact, { required: true }),
           chapter,
         };
+        const evidence = str(obj.evidence, 'fact.evidence', 800);
+        if (evidence) fact.evidence = evidence;
         const supersedes = str(obj.supersedes, `newFacts[${i}].supersedes`, BIBLE_LIMITS.fact);
         if (supersedes) fact.supersedes = supersedes;
         return fact;
@@ -184,7 +203,7 @@ export function validateBiblePatch(raw: unknown, chapter: number): BibleEntryPat
 }
 
 /** Merge a validated patch onto an existing entry (or a fresh skeleton). */
-export function applyBiblePatch(
+export function mergeBiblePatch(
   existing: BibleEntry | null,
   id: string,
   patch: BibleEntryPatch,
@@ -223,6 +242,9 @@ export function applyBiblePatch(
     );
   }
 
+  if (patch.newKnowledge?.some(k => k.supersedes && !(base.knowledge ?? []).some(old => old.id === k.supersedes))) fail('Knowledge supersedes must refer to an existing knowledge id');
+  const knowledge = patch.newKnowledge ? [...(base.knowledge ?? []).filter(k => !patch.newKnowledge!.some(n => n.supersedes === k.id || n.id === k.id)), ...patch.newKnowledge] : base.knowledge;
+  if (knowledge && knowledge.length > 60) fail('An entry supports at most 60 active knowledge records; correct or consolidate existing records first');
   return {
     ...base,
     type: patch.type ?? base.type,
@@ -234,7 +256,14 @@ export function applyBiblePatch(
     status: patch.status !== undefined && patch.status !== '' ? patch.status : base.status,
     attributes: patch.attributes ? { ...base.attributes, ...patch.attributes } : base.attributes,
     facts,
+    ...(knowledge ? { knowledge } : {}),
     relationships: patch.relationships ?? base.relationships,
     updatedAt: now,
   };
+}
+
+/** Every mutation records provenance. Call mergeBiblePatch only when replaying that ledger. */
+export function applyBiblePatch(existing: BibleEntry | null, id: string, patch: BibleEntryPatch, chapter: number, source: { revision: string; origin: 'chapter' | 'author' } = { revision: 'legacy', origin: 'chapter' }): BibleEntry {
+  const next = mergeBiblePatch(existing, id, patch, chapter);
+  return recordCanon(existing, next, patch, chapter, source.revision, source.origin);
 }

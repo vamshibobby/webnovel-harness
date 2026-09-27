@@ -45,7 +45,7 @@ bibleRoutes.post('/', async (c) => {
     const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
     // Provenance is the chapter the bible has reached: this is what the author
     // knows as of now, not something a past chapter said.
-    const chapter = Math.max(1, novel.bibleChapter ?? 1);
+    const chapter = Math.max(1, novel.chapterCount ?? 0, novel.bibleChapter ?? 1);
     const patch = validateBiblePatch(body, chapter);
     if (!patch.name || !patch.type) {
       return c.json({ error: 'name and type are required' }, 400);
@@ -65,7 +65,7 @@ bibleRoutes.post('/', async (c) => {
     }
 
     const entry = await store.transactBibleEntry(novel.id, id, (current) =>
-      applyBiblePatch(current, id, patch, chapter)
+      applyBiblePatch(current, id, patch, chapter, { origin: 'author', revision: 'author' })
     );
     return c.json({ entry }, 201);
   } catch (err) {
@@ -90,9 +90,9 @@ bibleRoutes.patch('/:entryId', async (c) => {
     if (!existing) return c.json({ error: 'Entry not found' }, 404);
 
     // Author edits carry the entry's own provenance for any new facts.
-    const patch = validateBiblePatch(body, existing.firstChapter);
+    const patch = validateBiblePatch(body, Math.max(1, novel.chapterCount ?? 0, novel.bibleChapter ?? 1));
     const next = await store.transactBibleEntry(novel.id, entryId, (current) =>
-      applyBiblePatch(current ?? existing, entryId, patch, existing.firstChapter)
+      applyBiblePatch(current ?? existing, entryId, patch, Math.max(1, novel.chapterCount ?? 0, novel.bibleChapter ?? 1), { origin: 'author', revision: 'author' })
     );
     return c.json({ entry: next });
   } catch (err) {
@@ -121,8 +121,7 @@ bibleRoutes.delete('/:entryId', async (c) => {
  *
  * Strictly sequential in chapter order: canon is ordered (chapter 3's update
  * may depend on entries chapter 2 created), and concurrent runs could each
- * update the same character at once. Reads chapter SUMMARIES, not full text —
- * far cheaper per chapter, and the sequential loop keeps the agent's own
+ * update the same character at once. Reads full chapter text for evidence verification; the sequential loop keeps the agent's own
  * prompt prefix warm between chapters. The high-water mark advances after
  * each chapter, so an aborted run resumes exactly where it stopped.
  */
@@ -146,8 +145,10 @@ bibleRoutes.post('/update', async (c) => {
 
   return streamSSE(c, async (stream) => {
     let aborted = false;
+    const controller = new AbortController();
     stream.onAbort(() => {
       aborted = true;
+      controller.abort();
     });
 
     let done = 0;
@@ -163,11 +164,16 @@ bibleRoutes.post('/update', async (c) => {
             total: pending.length,
           }),
         });
+        if (chapter.canonProposal?.state === 'pending') {
+          await stream.writeSSE({ event: 'trace', data: JSON.stringify(`Chapter ${chapter.number} already has canon changes awaiting review. Open that chapter to review them.`) });
+          break;
+        }
         const result = await runBibleUpdate({
           apiKey,
           novel,
           chapter,
-          source: 'summary',
+          source: 'chapter',
+          signal: controller.signal,
           emit: (event) => {
             if (event.type === 'trace') {
               void stream.writeSSE({ event: 'trace', data: JSON.stringify(event.data) });
@@ -176,6 +182,10 @@ bibleRoutes.post('/update', async (c) => {
         });
         if (result.usage.promptTokens > 0) {
           await stream.writeSSE({ event: 'usage', data: JSON.stringify(result.usage) });
+        }
+        if (result.pendingReview) {
+          await stream.writeSSE({ event: 'trace', data: JSON.stringify(`Chapter ${chapter.number} has canon changes to review. Approve or reject them before continuing.`) });
+          break;
         }
         // Advance per chapter so an aborted run resumes where it stopped.
         await store.updateNovel(novel.id, { bibleChapter: chapter.number });

@@ -8,7 +8,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
@@ -63,6 +63,7 @@ export function dataPath(...segments: string[]): string {
 }
 
 export function readDoc<T>(file: string): T | null {
+  recoverDocuments();
   if (!existsSync(file)) return null;
   return JSON.parse(readFileSync(file, 'utf8')) as T;
 }
@@ -84,6 +85,7 @@ export function removeTree(dir: string): void {
 
 /** Every `*.json` document directly inside `dir`, in no particular order. */
 export function listDocs<T>(dir: string): T[] {
+  recoverDocuments();
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
     .filter((name) => name.endsWith('.json'))
@@ -110,4 +112,27 @@ export function defined<T extends object>(patch: T): Partial<T> {
 export function writeBinary(file: string, data: Buffer): void {
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, data);
+}
+
+/** Single-process write-ahead journal. A restart completes a committed batch
+ * before any reader can observe a partly applied chapter/canon/job write. */
+const journalFile = dataPath('.pending-writes.json');
+let applying = false;
+export function recoverDocuments(): void {
+  if (applying || !existsSync(journalFile)) return;
+  applying = true;
+  try {
+    const writes = JSON.parse(readFileSync(journalFile, 'utf8')) as Array<{file: string; data: unknown}>;
+    for (const write of writes) {
+      const rel = relative(DATA_DIR, write.file);
+      if (rel.startsWith('..') || isAbsolute(rel) || write.file === journalFile) throw new Error('Invalid recovery journal path');
+      writeDoc(write.file, write.data);
+    }
+    removeDoc(journalFile);
+  } finally { applying = false; }
+}
+export function writeDocuments(writes: Array<{file: string; data: unknown}>): void {
+  recoverDocuments();
+  writeDoc(journalFile, writes);
+  recoverDocuments();
 }

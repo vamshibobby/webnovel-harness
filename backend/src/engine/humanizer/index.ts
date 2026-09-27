@@ -27,12 +27,18 @@
  * and instruction compliance is preserved (96.7% to 98.4%). Cadence and
  * structure are NOT touched by this pass and cannot be — see diagnose.ts.
  */
+import { rolePolicy } from '../../lib/modelPolicy.js';
 import { streamChat, type ChatMessage } from '../openrouter.js';
-import { diagnose, formatDiagnosis, properNounSet, type Defect, type DefectKind } from './diagnose.js';
+import { diagnose as baseDiagnose, formatDiagnosis, properNounSet, type Defect, type DefectKind } from './diagnose.js';
 import { words } from './text.js';
 
-export { diagnose, analyseHeading } from './diagnose.js';
+export { analyseHeading } from './diagnose.js';
 export type { Defect, DefectKind, Diagnosis } from './diagnose.js';
+
+export function diagnose(content: string, targetWords = 0, disabledMetrics: string[] = []) {
+  const result = baseDiagnose(content, targetWords);
+  return { ...result, defects: result.defects.filter(d => !disabledMetrics.includes(d.kind)) };
+}
 
 const MAX_ROUNDS = 3;
 /** Below this the pass is deleting rather than repairing. */
@@ -109,6 +115,7 @@ export async function humanizeChapter(args: {
   model: string;
   content: string;
   targetWords?: number;
+  disabledMetrics?: string[];
   /** Overrides POLISH_SAMPLING. Pass {} to run at provider defaults. */
   sampling?: Record<string, number>;
   /** Overrides POLISH_PROVIDER. Pass null to let the normal router choose. */
@@ -118,7 +125,7 @@ export async function humanizeChapter(args: {
 }): Promise<HumanizeResult> {
   const emit = args.emit ?? (() => {});
   let current = args.content;
-  let diagnosis = diagnose(current, args.targetWords ?? 0);
+  let diagnosis = diagnose(current, args.targetWords ?? 0, args.disabledMetrics);
   const started = diagnosis.defects.map((d) => d.kind);
   const rounds: HumanizeRound[] = [];
   let cost = 0;
@@ -146,14 +153,15 @@ export async function humanizeChapter(args: {
     ];
 
     const res = await streamChat({
+      role: 'editor',
       apiKey: args.apiKey,
       model: args.model,
       messages,
       maxTokens: 8000,
       signal: args.signal,
-      sampling: args.sampling ?? { ...POLISH_SAMPLING },
+      sampling: args.sampling ?? (rolePolicy('editor').model ? {} : { ...POLISH_SAMPLING }),
       providerOverride:
-        args.providerOverride === null ? undefined : (args.providerOverride ?? { ...POLISH_PROVIDER }),
+        args.providerOverride === null || (args.providerOverride === undefined && rolePolicy('editor').model) ? undefined : (args.providerOverride ?? { ...POLISH_PROVIDER }),
       // The prompt is a different chapter every time, so the cache-warming pin
       // buys nothing here; the pin that is sent exists for sampler support.
       pinProvider: false,
@@ -184,7 +192,7 @@ export async function humanizeChapter(args: {
       break;
     }
 
-    const next = diagnose(candidate, args.targetWords ?? 0);
+    const next = diagnose(candidate, args.targetWords ?? 0, args.disabledMetrics);
     const after = next.defects.map((d) => d.kind);
     if (before.every((k) => after.includes(k))) {
       emit({ type: 'trace', data: `Pass ${round} discarded: nothing was fixed.` });

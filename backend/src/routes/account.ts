@@ -24,14 +24,15 @@ accountRoutes.get('/export', async (c) => {
   // planning, which is their writing as much as the chapters are.
   const complete = await Promise.all(
     novels.map(async (novel) => {
-      const [chapters, bible, designs, arcs, map] = await Promise.all([
+      const [chapters, bible, designs, arcs, map, power, naming, jobs] = await Promise.all([
         store.getAllChapters(novel.id),
         store.listBibleEntries(novel.id),
         store.listDesigns(novel.id),
         store.listArcs(novel.id),
         store.getMap(novel.id),
+        store.listPowerSystems(novel.id), store.getCharterDoc(novel.id), store.listJobs(novel.id),
       ]);
-      return { ...novel, chapters, bible, designs, arcs, map };
+      return { ...novel, chapters, bible, designs, arcs, map, power, naming, jobs };
     })
   );
 

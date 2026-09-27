@@ -399,6 +399,7 @@ export async function runCoin(args: CoinArgs): Promise<CoinResult> {
   let total = EMPTY_USAGE;
   for (let round = 0; round < MAX_ROUNDS; round++) {
     const result = await streamChat({
+      role: 'naming',
       apiKey: args.apiKey,
       model: NAMING_MODEL,
       messages,

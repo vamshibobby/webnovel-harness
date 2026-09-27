@@ -1,3 +1,6 @@
+import { randomUUID } from 'node:crypto';
+import { canonConflicts, entryHash, revisionOf, sourcePatch, type CanonProposal } from '../lib/canon.js';
+import type { BibleEntryPatch } from '../lib/bibleValidate.js';
 import { BibleValidationError, applyBiblePatch, slugifyBibleName, validateBiblePatch, BIBLE_LIMITS } from '../lib/bibleValidate.js';
 import * as store from '../lib/store.js';
 import type { BibleEntry, Chapter, Novel } from '../lib/types.js';
@@ -133,11 +136,19 @@ const UPDATE_SYSTEM_PROMPT = [
   'replaces the whole list, so when changing it, send the complete current set. Keep natures',
   'short: "sworn enemy", "master of", "owns", "member of".',
   '',
+  '## CHARACTER KNOWLEDGE',
+  'World truth is not shared knowledge. Record newKnowledge only when the chapter shows a character',
+  'learning, believing, being explicitly unaware of, or privately holding a significant fact.',
+  'Each record needs fact, kind (knows/believes/unaware/secret), via (how it reached them), and an exact evidence quote.',
+  'A mistaken belief stays a belief. Use supersedes with the previous knowledge id when that belief changes.',
+  'Do not infer that everyone knows what the narrator or another character knows.',
+  '',
   '## HARD RULES',
+  '- Include an exact evidence passage on each update and each new fact. Proposed changes are reviewed separately from prose.',
+
   '- Never invent. Record only what this chapter states or unmistakably implies. If the text is',
   '  ambiguous, record the ambiguity ("fate unknown — fell from the bridge, body not found").',
-  '- When the chapter contradicts the bible, the CHAPTER wins — it is newer canon. Update state',
-  '  and record the supersession.',
+  '- When the chapter contradicts the bible, propose the change with evidence and supersession; the author decides whether to accept it.',
   '- If a tool call returns an error, read the error, fix the arguments, and retry once. The',
   '  errors are precise (caps, missing fields, id collisions).',
   '- If NOTHING in the chapter clears the selection bar, that is a valid outcome: make no',
@@ -173,6 +184,7 @@ const POWER_PROMPT_SECTION = [
 
 export interface BibleUpdateResult {
   usage: Usage;
+  pendingReview: boolean;
   /** Display names of entries touched — these are shown to the author. */
   updated: string[];
   created: string[];
@@ -193,19 +205,34 @@ export async function runBibleUpdate(args: {
   novel: Novel;
   chapter: Chapter;
   source: 'chapter' | 'summary';
+  preview?: boolean;
   signal?: AbortSignal;
   emit?: (event: AgentEvent) => void;
 }): Promise<BibleUpdateResult> {
   const emit = args.emit ?? (() => {});
   let entries = await store.listBibleEntries(args.novel.id);
+  const originals = new Map(entries.map(e => [e.id, e]));
+  const proposal: CanonProposal = { id: randomUUID(), revision: revisionOf(args.chapter.content), changes: [], createdAt: Date.now(), state: 'pending' };
+  const stage = async (id: string, patch: BibleEntryPatch): Promise<BibleEntry> => {
+    const existing = entries.find(e => e.id === id) ?? null;
+    const sourced = sourcePatch(patch, args.chapter, args.source === 'summary' ? args.chapter.summary.trim() || args.chapter.content.slice(0, 4000) : args.chapter.content);
+    for (const relation of patch.relationships ?? []) if (!entries.some(e => e.id === relation.targetId)) throw new BibleValidationError(`Unknown relationship target: ${relation.targetId}`);
+    if (patch.newKnowledge?.length && (patch.type ?? existing?.type) !== 'character') throw new BibleValidationError('Knowledge belongs to character entries.');
+    const next = applyBiblePatch(existing, id, sourced, args.chapter.number, { revision: proposal.revision, origin: 'chapter' });
+    proposal.changes.push({ entryId: id, name: next.name, baseHash: entryHash(originals.get(id) ?? null), patch: sourced, conflicts: [...canonConflicts(existing, sourced), ...(!sourced.evidence ? ['No source passage supplied for this update'] : [])] });
+    entries = [...entries.filter(e => e.id !== id), next];
+    return next;
+  };
   // One cheap query per run on a ≤5-doc collection. Empty means no power
   // tools, no prompt section, and no index line — the feature costs nothing
   // until the author builds a system.
   let systems = await store.listPowerSystems(args.novel.id);
+  const originalSystems = new Map(systems.map(s => [s.id, s]));
   let total = EMPTY_USAGE;
   const updated: string[] = [];
   const created: string[] = [];
   const power: string[] = [];
+  const unresolved = new Set<string>();
 
   const text =
     args.source === 'chapter'
@@ -240,6 +267,7 @@ export async function runBibleUpdate(args: {
   for (let round = 0; round <= MAX_ROUNDS; round++) {
     const forceStop = round === MAX_ROUNDS;
     const result = await streamChat({
+      role: 'bible',
       apiKey: args.apiKey,
       model: BIBLE_MODEL,
       messages,
@@ -297,15 +325,13 @@ export async function runBibleUpdate(args: {
           output = await handleUpsert(args.novel.id, args.chapter.number, parsed, entries, {
             onUpdated: (e) => {
               updated.push(e.name);
-              emit({ type: 'trace', data: `Bible: updated ${e.name}` });
+              emit({ type: 'trace', data: `Bible: proposed update to ${e.name}` });
             },
             onCreated: (e) => {
               created.push(e.name);
-              emit({ type: 'trace', data: `Bible: created ${e.name}` });
+              emit({ type: 'trace', data: `Bible: proposed ${e.name}` });
             },
-          });
-          // Refresh the in-memory view so later rounds see this write.
-          entries = await store.listBibleEntries(args.novel.id);
+          }, stage);
           break;
         }
         case 'get_power_system': {
@@ -328,15 +354,23 @@ export async function runBibleUpdate(args: {
             'model',
             (s) => {
               power.push(s.name);
-              emit({ type: 'trace', data: `Power: updated ${s.name}` });
+              emit({ type: 'trace', data: `Power: proposed ${s.name}` });
+            },
+            async (id, merge) => {
+              const next = { ...merge(systems.find(s => s.id === id) ?? null), canonChapter: args.chapter.number, canonRevision: proposal.revision, canonNeedsReview: false };
+              systems = systems.map(s => s.id === id ? next : s);
+              proposal.powerChanges = [...(proposal.powerChanges ?? []).filter(s => s.id !== id), { id, name: next.name, baseHash: revisionOf(JSON.stringify(originalSystems.get(id))), next }];
+              return next;
             }
           );
-          // Same refresh contract as the bible upsert above.
-          systems = await store.listPowerSystems(args.novel.id);
           break;
         }
         default:
           output = `Unknown tool: ${call.function.name}`;
+      }
+      if (call.function.name.startsWith('upsert_')) {
+        const key = `${call.function.name}:${String(parsed.id || parsed.name || 'unknown')}`;
+        if (output.startsWith('Error:')) unresolved.add(key); else unresolved.delete(key);
       }
       messages.push({ role: 'tool', tool_call_id: call.id, content: output });
     }
@@ -346,7 +380,13 @@ export async function runBibleUpdate(args: {
     `[bible] novel=${args.novel.id} ch=${args.chapter.number} source=${args.source} ` +
       `created=${created.length} updated=${updated.length} power=${power.length} cost=$${total.cost.toFixed(5)}`
   );
-  return { usage: total, updated, created, power: [...new Set(power)] };
+  args.signal?.throwIfAborted();
+  if (unresolved.size) throw new Error('Canon extraction could not validate all proposed changes. Existing canon is unchanged; retry extraction.');
+  await store.saveCanonProposal(args.novel.id, args.chapter.number, proposal);
+  const pendingReview = !!args.preview || proposal.changes.some(c => c.conflicts.length > 0) || !!proposal.powerChanges?.length;
+  if (!pendingReview) await store.resolveCanonProposal(args.novel.id, args.chapter.number, proposal.revision, true, proposal.id);
+  if (pendingReview) emit({ type: 'trace', data: 'Canon changes are ready for review. Existing canon is unchanged.' });
+  return { usage: total, updated: pendingReview ? [] : updated, created: pendingReview ? [] : created, power: pendingReview ? [] : [...new Set(power)], pendingReview };
 }
 
 /**
@@ -359,7 +399,8 @@ async function handleUpsert(
   chapter: number,
   raw: Record<string, unknown>,
   entries: BibleEntry[],
-  on: { onUpdated: (e: BibleEntry) => void; onCreated: (e: BibleEntry) => void }
+  on: { onUpdated: (e: BibleEntry) => void; onCreated: (e: BibleEntry) => void },
+  stage: (id: string, patch: BibleEntryPatch) => Promise<BibleEntry>
 ): Promise<string> {
   try {
     const patch = validateBiblePatch(raw, chapter);
@@ -370,9 +411,7 @@ async function handleUpsert(
       if (!existing) {
         return `Error: no entry with id "${requestedId}". Use search_story_bible to find the right id, or omit id to create.`;
       }
-      const next = await store.transactBibleEntry(novelId, requestedId, (current) =>
-        applyBiblePatch(current ?? existing, requestedId, patch, chapter)
-      );
+      const next = await stage(requestedId, patch);
       on.onUpdated(next);
       return `Updated ${next.id}:\n${formatBibleEntry(next)}`;
     }
@@ -402,13 +441,11 @@ async function handleUpsert(
       return `Error: the bible is at its ${BIBLE_LIMITS.entriesPerNovel}-entry cap. Only update existing entries.`;
     }
 
-    const next = await store.transactBibleEntry(novelId, id, (current) =>
-      applyBiblePatch(current, id, patch, chapter)
-    );
+    const next = await stage(id, patch);
     on.onCreated(next);
     return `Created ${next.id}:\n${formatBibleEntry(next)}`;
   } catch (err) {
-    if (err instanceof BibleValidationError) {
+    if (err instanceof Error) {
       return `Error: ${err.message}`;
     }
     throw err;

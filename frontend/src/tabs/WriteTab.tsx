@@ -1,4 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { CanonReviewPanel } from '../components/CanonReviewPanel';
+import { JobRecovery } from '../components/JobRecovery';
+import { DraftRecovery, clearDraft } from '../components/DraftRecovery';
+import type { NovelJob } from '../lib/harnessTypes';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { del, get, patch, post, settings } from '../lib/api';
 import type { Chapter, ChapterMeta, ChapterSuggestion, Blueprint, Usage } from '../lib/types';
 import { useStream } from '../lib/useStream';
@@ -9,9 +13,12 @@ type Selection = number | 'new';
 
 export function WriteTab(props: TabProps) {
   const { base, novel } = props;
+  const recovery = useStream();
+  const [recoveryVersion, setRecoveryVersion] = useState(0);
+  const loadJobs = useCallback(() => get<NovelJob[]>(`${base}/chapters/jobs`), [base]);
   const chapters = useLoad(() => get<ChapterMeta[]>(`${base}/chapters`), [base]);
   const [selected, setSelected] = useState<Selection | null>(null);
-  const [model, setModel] = useState(novel.defaultModel || settings.getModel());
+  const [model, setModel] = useState(novel.modelRoles?.writer?.model || novel.defaultModel || settings.getModel());
 
   const list = chapters.data ?? [];
   const next = list.reduce((m, c) => Math.max(m, c.number), 0) + 1;
@@ -50,11 +57,18 @@ export function WriteTab(props: TabProps) {
         </ul>
       </aside>
       <div className="pane">
+        <JobRecovery scope={base} load={loadJobs} cancel={async id => { await post(`${base}/chapters/jobs/${id}/cancel`, {}); }} resume={async job => {
+          await recovery.run(`${base}/chapters/${job.chapter}/${job.mode === 'upkeep' ? 'accept' : job.mode}`, { ...job.input, resume: true });
+          await refresh(job.chapter);
+          setRecoveryVersion(v => v + 1);
+        }} />
+        {recovery.running && <StreamPanel stream={recovery} title="Recovering job" />}
+
         {current === 'new' ? (
           <Composer key={`new-${next}`} {...props} n={next} model={model} onWritten={(n) => refresh(n)} />
         ) : (
           <ChapterView
-            key={current}
+            key={`${current}:${recoveryVersion}`}
             {...props}
             n={current}
             model={model}
@@ -173,6 +187,8 @@ function ChapterView({
   const [notes, setNotes] = useState('');
   const [defects, setDefects] = useState<Defect[] | null>(null);
   const [inline, setInline] = useState({ action: 'rewrite', instruction: '' });
+  const [protectedFacts, setProtectedFacts] = useState('');
+  const [alternatives, setAlternatives] = useState<Array<{ replacement: string; start: number; end: number; warning?: string }>>([]);
   const [selection, setSelection] = useState<{ start: number; end: number } | null>(null);
   const [replacement, setReplacement] = useState<{ replacement: string; start: number; end: number; warning?: string } | null>(null);
   const [saveUsage, setSaveUsage] = useState<Usage | null>(null);
@@ -199,7 +215,8 @@ function ChapterView({
   const save = (origin?: 'inline' | 'restore', override?: { title: string; content: string }) =>
     action.run(async () => {
       const body = override ?? { title, content };
-      const r = await patch<{ chapter: Chapter; usage: Usage | null }>(`${base}/chapters/${n}`, { ...body, origin });
+      const r = await patch<{ chapter: Chapter; usage: Usage | null }>(`${base}/chapters/${n}`, { ...body, origin, expectedUpdatedAt: ch.updatedAt });
+      clearDraft(`${base}:${n}`);
       chapter.setData(r.chapter);
       setSaveUsage(r.usage);
       onChanged();
@@ -242,7 +259,10 @@ function ChapterView({
   const captureSelection = () => {
     const el = textRef.current;
     if (!el) return;
-    if (el.selectionEnd > el.selectionStart) setSelection({ start: el.selectionStart, end: el.selectionEnd });
+    if (el.selectionEnd > el.selectionStart) {
+      if (selection?.start !== el.selectionStart || selection?.end !== el.selectionEnd) { setAlternatives([]); setReplacement(null); }
+      setSelection({ start: el.selectionStart, end: el.selectionEnd });
+    }
   };
 
   const runInline = async () => {
@@ -257,10 +277,10 @@ function ChapterView({
       start: selection.start,
       end: selection.end,
       text: content.slice(selection.start, selection.end),
-      instruction: inline.instruction,
+      instruction: inline.instruction, protectedFacts,
       model: m,
     })) as { replacement: string; start: number; end: number; warning?: string } | null;
-    if (done) setReplacement(done);
+    if (done) { setReplacement(done); setAlternatives(a => [...a, done].slice(-5)); }
   };
 
   const applyInline = async () => {
@@ -270,6 +290,7 @@ function ChapterView({
     await save('inline', { title, content: next });
     setReplacement(null);
     setSelection(null);
+    setAlternatives([]);
   };
 
   const preview = () =>
@@ -289,6 +310,12 @@ function ChapterView({
 
   return (
     <div className="chapter">
+      <CanonReviewPanel disabled={dirty || stream.running} accepted={ch.status === 'accepted'} proposal={ch.canonProposal} stale={ch.summaryStale} runs={ch.modelRuns}
+        onExtract={async () => { const r = await post<{ chapter: Chapter }>(`${base}/chapters/${n}/canon/preview`, {}); chapter.setData(r.chapter); }}
+        onReview={async accept => { const r = await post<{ chapter: Chapter }>(`${base}/chapters/${n}/canon/review`, { revision: ch.canonProposal!.revision, accept, proposalId: ch.canonProposal!.id }); chapter.setData(r.chapter); }}
+        onRefresh={async () => { await runStream('memory upkeep', `${base}/chapters/${n}/accept`, { model: m }); await chapter.reload(); }} />
+      <DraftRecovery key={`${base}:${n}:${ch.updatedAt}`} scope={`${base}:${n}`} saved={ch} title={title} content={content} onRestore={d => { setTitle(d.title); setContent(d.content); }} />
+
       <div className="row">
         <input className="title-input grow" value={title} onChange={(e) => setTitle(e.target.value)} />
         <span className={`badge ${ch.status}`}>{ch.status}</span>
@@ -339,7 +366,7 @@ function ChapterView({
           <summary>Inline edit {selection ? `(${selection.end - selection.start} chars selected)` : '(select text above)'}</summary>
           <div className="row">
             <select value={inline.action} onChange={(e) => setInline({ ...inline, action: e.target.value })}>
-              {['rewrite', 'expand', 'shorten', 'describe', 'custom'].map((a) => (
+              {['rewrite', 'expand', 'shorten', 'describe', 'conflict', 'voice', 'clarity', 'custom'].map((a) => (
                 <option key={a}>{a}</option>
               ))}
             </select>
@@ -354,6 +381,8 @@ function ChapterView({
             </button>
           </div>
           {selection && <blockquote className="small">{content.slice(selection.start, selection.end).slice(0, 400)}</blockquote>}
+          <label>Facts this edit must preserve<textarea maxLength={2000} value={protectedFacts} onChange={e => setProtectedFacts(e.target.value)} /></label>
+          {alternatives.length > 1 && <label>Compare alternatives<select value={alternatives.findIndex(a => a === replacement)} onChange={e => setReplacement(alternatives[Number(e.target.value)])}>{alternatives.map((_a,i) => <option key={i} value={i}>Version {i+1}</option>)}</select></label>}
           {replacement && (
             <div className="card">
               {replacement.warning && <div className="warn">{replacement.warning}</div>}

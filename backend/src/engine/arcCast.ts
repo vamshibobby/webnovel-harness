@@ -987,6 +987,7 @@ export async function runCastPass(args: CastPassArgs): Promise<CastPassResult> {
   for (let round = 0; round < MAX_ROUNDS; round++) {
     if (round > 0) emit({ type: 'trace', data: 'Correcting the list…' });
     const result = await streamChat({
+      role: 'planner',
       apiKey: args.apiKey,
       model: CAST_MODEL,
       messages,

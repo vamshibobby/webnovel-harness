@@ -152,6 +152,7 @@ function SystemView({ base, system, onChanged, onDeleted }: { base: string; syst
         </button>
       </div>
       <p>{system.summary}</p>
+      {system.canonNeedsReview && <p role="status">A source chapter changed. Review and save this system’s details before it is used to write more chapters.</p>}
       {system.energyName && <p className="small">Energy: {system.energyName}</p>}
       <ol className="ladder">
         {system.ranks.map((r) => (

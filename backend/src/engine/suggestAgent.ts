@@ -434,6 +434,7 @@ export async function runSuggestions(args: {
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
     const result = await streamChat({
+      role: 'suggestions',
       apiKey: args.apiKey,
       model: SUGGEST_MODEL,
       messages,

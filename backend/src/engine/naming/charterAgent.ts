@@ -216,6 +216,7 @@ export async function runCharterDerive(args: {
   let total = EMPTY_USAGE;
   for (let round = 0; round < MAX_ROUNDS; round++) {
     const result = await streamChat({
+      role: 'naming',
       apiKey: args.apiKey,
       model: CHARTER_MODEL,
       messages,

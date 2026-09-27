@@ -225,3 +225,15 @@ pre.mono { white-space: pre-wrap; background: var(--desk); padding: 8px; border-
   .split, .atlas { grid-template-columns: 1fr; }
   .sublist { border-right: 0; padding-right: 0; }
 }
+
+/* Shared harness controls, styled to match the local writing desk. */
+.harness-panel, .harness-settings > details { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 12px 0; }
+.harness-panel > summary, .harness-settings summary { font-weight: 600; }
+.harness-panel section, .harness-settings fieldset { padding: 10px; margin-top: 10px; border: 1px solid var(--line); border-radius: 6px; }
+.harness-panel label, .harness-settings label { display: block; margin-top: 8px; }
+.harness-panel input, .harness-panel textarea, .harness-panel select, .harness-settings input:not([type=checkbox]), .harness-settings textarea { width: 100%; }
+.harness-settings input[type=checkbox] { width: auto; margin-right: 6px; }
+.harness-panel button { margin: 8px 8px 0 0; }
+.harness-panel pre { max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.harness-panel blockquote { border-left: 2px solid var(--line); padding-left: 12px; margin: 8px 0; }
+.harness-panel p, .harness-settings p { margin: 8px 0; }

@@ -1,3 +1,4 @@
+import { configureModelPolicy } from './modelPolicy.js';
 import {
   createHmac,
   randomBytes,
@@ -227,5 +228,6 @@ export async function loadAccessibleNovel(c: Context<AuthEnv>): Promise<Novel | 
   const novel = await store.getNovel(c.get('uid'), c.req.param('novelId') ?? '');
   if (!novel) return null;
   if (novel.hidden && !(await isUnlocked(c))) return null;
+  configureModelPolicy(novel.modelRoles);
   return novel;
 }
